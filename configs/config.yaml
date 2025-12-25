@@ -1,0 +1,8 @@
+defaults:
+  - data: stage2
+  - model: mmdit
+  - train: stage2
+  - vae: vae
+  - optim: adamw
+  - wandb: stage2
+  - _self_

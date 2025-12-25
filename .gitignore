@@ -1,0 +1,114 @@
+### Minimal repo .gitignore (logs, datasets, checkpoints, junk)
+
+# Python cache/bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Hydra
+.hydra/
+hydra_outputs/
+multirun/
+
+# Logs / runs
+logs/
+*.log
+runs/
+tb_logs/
+tensorboard_logs/
+
+# Weights & Biases
+wandb/
+.wandb/
+
+# Training artifacts / checkpoints (keep model source code tracked)
+checkpoints/
+saved_models/
+outputs/fw*/
+outputs/
+output/
+0saved_models/
+0new_model/
+
+# Pretrained / downloaded model artifacts in this repo
+t5gemma/
+
+# Large dataset files
+data/datasets/
+data/datasets
+data/common
+data/**/*.array_record
+data/**/*.tfrecord
+data/**/*.tfrecords
+data/**/*.parquet
+data/**/*.arrow
+
+# Numpy dumps / weights (common large artifacts)
+*.npy
+*.npz
+*.ckpt
+*.pth
+*.pt
+*.pkl
+*.pickle
+*.safetensors
+
+# Useless dotfiles / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.env
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+
+# Large files
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# Compiled binaries
+*.exe
+*.out
+*.app
+
+# JAX/XLA cache
+.jax_cache/
+.xla_cache/
+
+# ArrayRecord temporary files
+*.array_record.tmp
+*.array_record.lock
+

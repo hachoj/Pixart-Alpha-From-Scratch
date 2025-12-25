@@ -1,0 +1,10 @@
+_target_: models.mmDiT.dit.DiT
+in_dim: 16
+dim: 1152
+cond_dim: 256
+text_dim: 2048
+num_heads: 16
+mlp_ratio: 4
+num_blocks: 28
+patch_size: 2
+base_image_size: 32

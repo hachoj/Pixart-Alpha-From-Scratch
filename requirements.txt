@@ -1,0 +1,39 @@
+# Core training (JAX/Equinox)
+# NOTE: JAX install is platform-specific (CPU vs CUDA vs ROCm).
+# Install JAX/JAXlib separately following the official instructions for your platform.
+# jax
+# jaxlib
+
+equinox
+optax
+diffrax
+orbax-checkpoint
+hydra-core
+omegaconf
+wandb
+
+# Data loading / storage
+# (Used by data/data.py and sharding scripts)
+
+grain
+array-record
+
+# Utils
+numpy
+einops
+jaxtyping
+
+# PyTorch-side utilities (VAE decode for logging; dataset sharding/latent preprocessing)
+
+torch
+diffusers
+torchvision
+datasets
+transformers
+tqdm
+psutil
+
+# Stage 2 text encoder
+# `train_stage2.py` imports `gemma` / `gemma.research.t5gemma`.
+# Install the appropriate Gemma/T5Gemma JAX package separately if you plan to run Stage 2.
+# gemma

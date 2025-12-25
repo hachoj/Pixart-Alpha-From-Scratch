@@ -1,0 +1,5 @@
+_target_: data.data.create_dataloader_stage_1
+file_path: data/datasets/image_net.array_record
+num_workers: 32
+batch_size: ${train.batch_size}
+seed: ${train.seed}
