@@ -1,49 +1,50 @@
-import equinox as eqx
-import jax
-import jax.numpy as jnp
-import jax.random as jr
-from jaxtyping import Array, PRNGKeyArray, Float
-from einops import rearrange
+import torch
+import torch.nn as nn
+from jaxtyping import Float
+from torch import Tensor
 
-from .mhsa import MHSA
-from .mlp import MLP
+from ..mhsa import MHSA
+from ..mlp import MLP
 
 
-class DiTBlock(eqx.Module):
-    mlp: MLP
-    attention: MHSA
-    adaLN1: eqx.nn.Linear
-    adaLN2: eqx.nn.Linear
+class adaLNOut(nn.Linear):
+    pass
 
-    def __init__(self, dim, cond_dim, num_heads, mlp_ratio, key: PRNGKeyArray):
-        key1, key2, key3, key4 = jr.split(key, 4)
 
-        self.attention = MHSA(dim, num_heads, key=key1)
-        self.mlp = MLP(dim, mlp_ratio, key=key2)
+class DiTBlock(nn.Module):
+    def __init__(self, dim, cond_dim, num_heads, mlp_ratio):
+        self.attention = MHSA(dim, num_heads)
+        self.mlp = MLP(dim, mlp_ratio)
 
-        self.adaLN1 = eqx.nn.Linear(cond_dim, dim, key=key3)
-        adaLN2_temp = eqx.nn.Linear(dim, dim * 6, key=key4)
-        adaLN_w = jnp.zeros_like(adaLN2_temp.weight)
-        adaLN_b = jnp.zeros_like(adaLN2_temp.bias)  # pyrefly:ignore
-        self.adaLN2 = eqx.tree_at(
-            lambda l: (l.weight, l.bias), adaLN2_temp, (adaLN_w, adaLN_b)
-        )
+        self.adaLN1 = nn.Linear(cond_dim, dim)
+        self.act = nn.SiLU()
+        self.adaLN2 = adaLNOut(dim, dim * 6)
 
-    def __call__(
+    def forward(
         self,
-        x: Float[Array, "num_patches embed_dim"],
-        t: Float[Array, "cond_dim"],
-        c: Float[Array, "cond_dim"],
-    ) -> Float[Array, "num_patches embed_dim"]:
+        x: Float[Tensor, "b seq_len embed_dim"],
+        t: Float[Tensor, "b cond_dim"],
+        c: Float[Tensor, "b cond_dim"],
+    ) -> Float[Tensor, "b seq_len embed_dim"]:
 
-        cond = t + c
+        cond: Float[Tensor, "b cond_dim"] = t + c
 
-        cond = self.adaLN1(cond)
-        cond = jax.nn.silu(cond)
-        cond = self.adaLN2(cond)
+        cond: Float[Tensor, "b cond_dim"] = self.adaLN1(cond)
+        cond: Float[Tensor, "b cond_dim"] = self.act(cond)
+        cond: Float[Tensor, "b cond_dim"] = self.adaLN2(cond)
 
-        gamma1, beta1, gamma2, beta2, alpha1, alpha2 = jnp.split(cond, 6, axis=0)
+        gamma1, beta1, gamma2, beta2, alpha1, alpha2 = torch.chunk(cond, 6, dim=-1)
 
-        x = self.attention(x, gamma1, beta1, alpha1)
-        x = self.mlp(x, gamma2, beta2, alpha2)
+        x: Float[Tensor, "b seq_len embed_dim"] = self.attention(
+            x, gamma1, beta1, alpha1
+        )
+        x: Float[Tensor, "b seq_len embed_dim"] = self.mlp(x, gamma2, beta2, alpha2)
         return x
+
+    def _init_weights(self, m: nn.Module) -> None:
+        if isinstance(m, adaLNOut):
+            nn.init.zeros_(m.weight)
+            nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Linear):
+            nn.init.kaiming_normal_(m.weight, mode="fan_in")
+            nn.init.zeros_(m.bias)
