@@ -1,178 +1,177 @@
-import equinox as eqx
-import jax
-import jax.numpy as jnp
-import jax.random as jr
-from jaxtyping import Array, PRNGKeyArray, Float, Int, Bool
+import torch
+import torch.nn as nn
 from einops import rearrange
+from jaxtyping import Bool, Float
+from torch import Tensor
 
 from .dit_block import DiTBlock
 
 
-class SinusoidalTimeEmbedding(eqx.Module):
-    emb: Float[Array, "half_dim"]
-    dim: int = eqx.field(static=True)
-    half_dim: int = eqx.field(static=True)
-
-    def __init__(self, dim: int):
-        half_dim = dim // 2
-        scale = jnp.log(10000.0) / (half_dim - 1)
-        freqs = jnp.exp(jnp.arange(half_dim) * -scale)
-
+class SinusoidalTimeEmbedding(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        assert dim % 2 == 0
         self.dim = dim
-        self.half_dim = half_dim
-        self.emb = freqs
 
-    def __call__(self, t: Float[Array, ""]) -> Float[Array, "dim"]:
-        t = t * 1000
-        emb = t * self.emb
-        emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)
+        half: int = self.dim // 2
+        freqs = torch.exp(
+            -torch.log(torch.tensor(10000.0)) * torch.arange(half) / (half - 1)
+        )
+        self.register_buffer("freqs", freqs)
+
+    def forward(self, times: Float[Tensor, "b"]) -> torch.Tensor:
+        b: int = times.shape[0]
+        device, dtype = times.device, times.dtype
+
+        angles = times[:, None] * self.freqs[None, :]  # pyrefly:ignore
+        emb = torch.empty((b, self.dim), device=device, dtype=dtype)
+        emb[:, 0::2] = torch.sin(angles)
+        emb[:, 1::2] = torch.cos(angles)
         return emb
 
 
-class SinusoidalPosEmbed(eqx.Module):
-    emb: Float[Array, "quarter_dim"]
-    dim: int = eqx.field(static=True)
-    quarter_dim: int = eqx.field(static=True)
-    base_h: int = eqx.field(static=True)
-    base_w: int = eqx.field(static=True)
+class SinusoidalPosEmbed(nn.Module):
+    # Type hint the buffer to help static analysis
+    div_term: Tensor
 
-    def __init__(self, dim: int, base_size: int, patch_size: int):
-        self.base_h = base_size // patch_size
-        self.base_w = base_size // patch_size
-
+    def __init__(self, dim: int, base_size: int, patch_size: int) -> None:
+        super().__init__()
+        assert dim % 4 == 0
         self.dim = dim
-        self.quarter_dim = dim // 4
+        self.base_size = base_size
+        self.patch_size = patch_size
 
-        scale = jnp.log(10000.0) / (self.quarter_dim - 1)
-        self.emb = jnp.exp(jnp.arange(self.quarter_dim) * -scale)
+        half_dim = dim // 2
+        div_term = torch.exp(
+            -torch.log(torch.tensor(10000.0)) * torch.arange(0, half_dim, 2) / half_dim
+        )
+        self.register_buffer("div_term", div_term)
 
-    def __call__(self, h: int, w: int) -> Float[Array, "h*w dim"]:
-        scale_h = self.base_h / h
-        scale_w = self.base_w / w
+    def forward(self, h: int, w: int) -> Float[Tensor, "1 n dim"]:
+        grid_h = h // self.patch_size
+        grid_w = w // self.patch_size
 
-        grid_y, grid_x = jnp.meshgrid(
-            jnp.arange(h) * scale_h, jnp.arange(w) * scale_w, indexing="ij"
+        scale_h = (self.base_size // self.patch_size) / grid_h
+        scale_w = (self.base_size // self.patch_size) / grid_w
+
+        device = self.div_term.device
+        dtype = self.div_term.dtype
+
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(grid_h, device=device, dtype=dtype)
+            * scale_h,  # pyrefly:ignore
+            torch.arange(grid_w, device=device, dtype=dtype)
+            * scale_w,  # pyrefly:ignore
+            indexing="ij",
         )
 
-        grid_y = grid_y.reshape(-1)
-        grid_x = grid_x.reshape(-1)
+        grid_y = grid_y.flatten()[:, None]
+        grid_x = grid_x.flatten()[:, None]
 
-        emb_y = grid_y[:, None] * self.emb[None, :]
-        emb_x = grid_x[:, None] * self.emb[None, :]
+        emb_y = grid_y * self.div_term[None, :]  # pyrefly:ignore
+        emb_x = grid_x * self.div_term[None, :]  # pyrefly:ignore
 
-        emb_y = jnp.concatenate([jnp.sin(emb_y), jnp.cos(emb_y)], axis=-1)
-        emb_x = jnp.concatenate([jnp.sin(emb_x), jnp.cos(emb_x)], axis=-1)
+        emb = torch.zeros((grid_h * grid_w, self.dim), device=device, dtype=dtype)
 
-        emb = jnp.concatenate([emb_y, emb_x], axis=-1)
+        emb[:, 0 : self.dim // 2 : 2] = torch.sin(emb_y)
+        emb[:, 1 : self.dim // 2 : 2] = torch.cos(emb_y)
 
-        return emb
+        emb[:, self.dim // 2 :: 2] = torch.sin(emb_x)
+        emb[:, self.dim // 2 + 1 :: 2] = torch.cos(emb_x)
+
+        return emb[None, :, :]
 
 
-class DiT(eqx.Module):
-    dit_blocks: list[DiTBlock]
-    layer_norm: eqx.nn.LayerNorm
-    patchify: eqx.nn.Conv2d
-    time_proj: SinusoidalTimeEmbedding
-    linear_out: eqx.nn.Linear
-    adaLN1: eqx.nn.Linear
-    adaLN2: eqx.nn.Linear
-    adaLN1_single: eqx.nn.Linear
-    adaLN2_single: eqx.nn.Linear
-    pos_embed: SinusoidalPosEmbed
-    p: int = eqx.field(static=True)
+class adaLNOut(nn.Linear):
+    pass
 
+
+class DiT(nn.Module):
     def __init__(
         self,
         in_dim,
         dim,
         cond_dim,
-        text_dim,
         num_heads,
         mlp_ratio,
         num_blocks,
         patch_size,
+        num_classes,
         base_image_size,
-        key: PRNGKeyArray,
     ):
-        key1, key3, key4, key5, key6, key7, key8 = jr.split(key, 7)
-
-        self.patchify = eqx.nn.Conv2d(
+        self.patchify = nn.Conv2d(
             in_dim,
             dim,
-            kernel_size=[patch_size, patch_size],
-            padding=[0, 0],
-            stride=[patch_size, patch_size],
-            key=key1,
+            kernel_size=patch_size,
+            padding=0,
+            stride=patch_size,
         )
 
+        self.cond_proj = nn.Embedding(num_classes, cond_dim)
         self.time_proj = SinusoidalTimeEmbedding(cond_dim)
 
-        dit_keys = jr.split(key3, num_blocks)
-        self.dit_blocks = [
-            DiTBlock(dim, text_dim, num_heads, mlp_ratio, key=dit_keys[i])
-            for i in range(num_blocks)
-        ]
+        self.dit_blocks = nn.ModuleList(
+            [DiTBlock(dim, cond_dim, num_heads, mlp_ratio) for i in range(num_blocks)]
+        )
 
-        self.layer_norm = eqx.nn.LayerNorm(dim, use_bias=False, use_weight=False)
+        self.layer_norm = nn.LayerNorm(dim, elementwise_affine=False, bias=False)
 
         reshape_dim = in_dim * patch_size**2
-        self.linear_out = eqx.nn.Linear(dim, reshape_dim, key=key4)
+        self.linear_out = nn.Linear(dim, reshape_dim)
         self.p = patch_size
 
         self.pos_embed = SinusoidalPosEmbed(dim, base_image_size, patch_size)
 
-        self.adaLN1 = eqx.nn.Linear(cond_dim, dim, key=key5)
-        adaLN2_temp = eqx.nn.Linear(dim, dim * 2, key=key6)
-        adaLN_w = jnp.zeros_like(adaLN2_temp.weight)
-        adaLN_b = jnp.zeros_like(adaLN2_temp.bias)  # pyrefly:ignore
-        self.adaLN2 = eqx.tree_at(
-            lambda l: (l.weight, l.bias), adaLN2_temp, (adaLN_w, adaLN_b)
-        )
+        self.adaLN1 = nn.Linear(cond_dim, dim)
+        self.act = nn.SiLU()
+        self.adaLN2 = adaLNOut(dim, dim * 2)
 
-        self.adaLN1_single = eqx.nn.Linear(cond_dim, dim, key=key7)
-        self.adaLN2_single = eqx.nn.Linear(dim, dim * 6, key=key8)
+        self.adaLN1_single = nn.Linear(cond_dim, dim)
+        self.adaLN2_single = nn.Linear(dim, 6 * dim)
 
-    def __call__(
+    def forward(
         self,
-        x: Float[Array, "in_dim height width"],
-        t: Float[Array, ""],
-        text_tokens: Float[Array, "text_embed_dim"],
-        text_mask: Bool[Array, "num_tokens"] | None = None,
-    ) -> Float[Array, "in_dim height width"]:
-        _, H, W = x.shape
+        x: Float[Tensor, "b in_dim height width"],
+        t: Float[Tensor, "b"],
+        text_tokens: Float[Tensor, "b num_tokens text_dim"],
+        text_mask: Bool[Tensor, "b num_tokens"],
+    ) -> Float[Tensor, "b in_dim height width"]:
+        H, W = x.shape[:-2]
         p = self.p
         h = H // p
         w = W // p
 
-        time_embed = self.time_proj(t)
+        time_embed: Float[Tensor, "b cond_dim"] = self.time_proj(t)
 
-        # [in_dim,H,W] -> [C,N]  N:=(H//P)(W//P)
-        x = self.patchify(x)
-        x = rearrange(x, "c h w -> (h w) c")
+        x: Float[Tensor, "b embed_dim h//p w//p"] = self.patchify(x)
+        x: Float[Tensor, "b num_patches embed_dim"] = rearrange(
+            x, "b c h w -> b (h w) c"
+        )
 
-        x = x + self.pos_embed(h, w)
+        x: Float[Tensor, "b num_patches embed_dim"] = x + self.pos_embed(h, w)
 
         sbar = self.adaLN1_single(time_embed)
+        sbar = self.act(sbar)
         sbar = self.adaLN2_single(sbar)
 
         for block in self.dit_blocks:
-            x = block(x, text_tokens, sbar, text_mask=text_mask)
+            x: Float[Tensor, "b num_patches embed_dim"] = block(
+                x, time_embed, sbar, text_mask
+            )
 
-            # use this below if I need more VRAM capacity
-            # x = eqx.filter_checkpoint(block)(x, time_embed, class_embed)
+        x: Float[Tensor, "b num_patches embed_dim"] = self.layer_norm(x)
+        cond: Float[Tensor, "b cond_dim"] = time_embed
 
-        x = jax.vmap(self.layer_norm)(x)
-        cond = time_embed
+        cond: Float[Tensor, "b ebmed_dim"] = self.adaLN1(cond)
+        cond: Float[Tensor, "b ebmed_dim"] = self.act(cond)
+        cond: Float[Tensor, "b 2*ebmed_dim"] = self.adaLN2(cond)
+        gamma, beta = torch.chunk(cond, 2, dim=-1)
 
-        cond = self.adaLN1(cond)
-        cond = jax.nn.silu(cond)
-        cond = self.adaLN2(cond)
-        gamma, beta = jnp.split(cond, 2, axis=0)
+        x: Float[Tensor, "b num_patches embed_dim"] = x * (1 + gamma) + beta
 
-        x = x * (1 + gamma) + beta
-
-        # [N,C] -> [N,p*p*in_dim]
-        x = jax.vmap(self.linear_out)(x)
-        x = rearrange(x, "(h w) (p1 p2 c) -> c (h p1) (w p2)", h=h, w=w, p1=p, p2=p)
+        x: Float[Tensor, "b num_patches 3*p*p"] = self.linear_out(x)
+        x: Float[Tensor, "b 3 h w"] = rearrange(
+            x, "(h w) (p1 p2 c) -> c (h p1) (w p2)", h=h, w=w, p1=p, p2=p
+        )
 
         return x
