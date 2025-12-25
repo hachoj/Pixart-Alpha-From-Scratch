@@ -7,10 +7,14 @@ model = AutoModelForSeq2SeqLM.from_pretrained(
     device_map="auto",
 )
 
-input_text = "Write me a poem about Machine Learning. Answer:"
-input_ids = tokenizer(input_text, return_tensors="pt").to("cuda")
+input_texts = [
+    "The easiest way to make a big pancake is ",
+    "this is some other crap text",
+]
+input_ids = tokenizer(
+    input_texts, padding=True, truncation=True, max_length=100, return_tensors="pt"
+).to("cuda")
 
-outputs = model.generate(**input_ids, max_new_tokens=32)
-print(tokenizer.decode(outputs[0]))
 
-# Then something something model surgery, shouldn't be too hard
+torch_model = model.model
+print(torch_model.encoder(**input_ids).last_hidden_state.shape)

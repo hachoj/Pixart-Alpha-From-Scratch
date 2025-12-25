@@ -1,4 +1,5 @@
 ### Minimal repo .gitignore (logs, datasets, checkpoints, junk)
+notebooks/
 
 # Python cache/bytecode
 __pycache__/

@@ -6,7 +6,6 @@ os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-import jax.sharding as jshard
 import orbax.checkpoint as ocp
 import equinox as eqx
 import optax
@@ -89,8 +88,6 @@ def single_sample_fn(model, noise, label):
 
 @eqx.filter_jit
 def generate_samples(model, noise, labels, model_sharding, data_sharding):
-    model = eqx.filter_shard(model, model_sharding)
-    noise, labels = eqx.filter_shard((noise, labels), data_sharding)
     return jax.vmap(single_sample_fn, in_axes=(None, 0, 0))(model, noise, labels)
 
 
@@ -105,11 +102,7 @@ def compute_grads(params, static, x_t, v, t, labels):
 
 @eqx.filter_jit(donate="all")
 def step_model(state, optimizer, x_t, v, t, labels, model_sharding, data_sharding):
-    # you shard again here for XLA efficiency, it doesn't
-    # actually divide the shards into smaller "sub-shards"
-
     # model, opt_state = state
-    state = eqx.filter_shard(state, model_sharding)
     model_fp32, opt_state = state
     mask = get_trainable_mask(model_fp32)
     params_fp32, static_fp32 = eqx.partition(model_fp32, mask)
@@ -122,7 +115,6 @@ def step_model(state, optimizer, x_t, v, t, labels, model_sharding, data_shardin
         lambda x: x.astype(jnp.bfloat16) if eqx.is_inexact_array(x) else x, static_fp32
     )
 
-    x_t, v, t, labels = eqx.filter_shard((x_t, v, t, labels), data_sharding)
     x_t, v, t = (
         x_t.astype(jnp.bfloat16),
         v.astype(jnp.bfloat16),
@@ -148,8 +140,6 @@ def train(
     data_iterator,
     vae,
     cfg,
-    model_sharding,
-    data_sharding,
     key,
     checkpoint_manager,
     step_start=0,
@@ -175,10 +165,6 @@ def train(
     validation_noise = jnp.repeat(validation_noise, repeats=8, axis=0)
     validation_labels = jnp.array([0, 5, 10, 15, 200, 500, 750, 1000])
 
-    # shard once before the loop since it's reused
-    validation_noise = eqx.filter_shard(validation_noise, data_sharding)
-    validation_labels = eqx.filter_shard(validation_labels, data_sharding)
-
     start_time = time.time()
 
     for step in range(step_start, cfg.train.total_steps):
@@ -190,10 +176,6 @@ def train(
         latents = batch["latent"]
         labels = batch["label"]
 
-        latents = jax.device_put(latents, data_sharding)
-        labels = jax.device_put(labels, data_sharding)
-
-        # with jax sharding, this still actually prints the global batch size
         B = latents.shape[0]
 
         key, sub_key = jr.split(key)
@@ -215,14 +197,11 @@ def train(
 
         key, sub_key = jr.split(key)
         # because jax sharding treats the shape as if it were on one GIGA-GPU
-        # I have to reshard this
         X0 = jax.random.normal(key, shape=X1.shape, dtype=X1.dtype)
-        X0 = jax.device_put(X0, data_sharding)
 
         # and the same idea for X0 is needed here
         key, sub_key = jr.split(key)
         eps = jax.random.normal(key, shape=[B])
-        eps = jax.device_put(eps, data_sharding)
 
         # t inherits the sharding from eps
         t = jax.nn.sigmoid(eps)
@@ -231,7 +210,7 @@ def train(
         Xt = t_mult * X1 + (1 - t_mult) * X0
 
         state, loss = step_model(
-            state, optimizer, Xt, X1 - X0, t, labels, model_sharding, data_sharding
+            state, optimizer, Xt, X1 - X0, t, labels
         )
         model, _opt_state = state
 
@@ -262,8 +241,6 @@ def train(
                 model_ema,
                 validation_noise,
                 validation_labels,
-                model_sharding,
-                data_sharding,
             )
 
             generated_latents_ema = generated_latents_ema + cfg.train.latent_mean
@@ -274,8 +251,6 @@ def train(
                 model,
                 validation_noise,
                 validation_labels,
-                model_sharding,
-                data_sharding,
             )
             generated_latents_model = generated_latents_model + cfg.train.latent_mean
             generated_latents_model = (
@@ -347,9 +322,6 @@ def train(
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig):
-    devices = jax.devices()
-    mesh = jshard.Mesh(devices, axis_names=("data",))
-
     key = jr.PRNGKey(cfg.train.seed)
 
     ckpt_dir = os.path.abspath(cfg.train.checkpoint_dir)
@@ -357,10 +329,6 @@ def main(cfg: DictConfig):
     checkpoint_manager = ocp.CheckpointManager(
         ckpt_dir, options=options, item_names=("state", "model_ema", "dataset")
     )
-
-    model_sharding = jshard.NamedSharding(mesh, jshard.PartitionSpec())
-    data_sharding = jshard.NamedSharding(mesh, jshard.PartitionSpec("data"))
-    cpu_sharding = jax.sharding.SingleDeviceSharding(jax.devices("cpu")[0])
 
     dataloader = hydra.utils.instantiate(cfg.data)
     data_iterator = iter(dataloader)
@@ -389,12 +357,12 @@ def main(cfg: DictConfig):
         state = (model, opt_state)
 
         abstract_state = jax.tree_util.tree_map(
-            lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=cpu_sharding),
+            lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype),
             state,
         )
 
         abstract_model = jax.tree_util.tree_map(
-            lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=cpu_sharding),
+            lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype),
             model,
         )
 
@@ -417,14 +385,6 @@ def main(cfg: DictConfig):
         state = restored["state"]
         model_ema = restored["model_ema"]
 
-        state = jax.tree_util.tree_map(
-            lambda x: jax.device_put(x, model_sharding) if eqx.is_array(x) else x, state
-        )
-        model_ema = jax.tree_util.tree_map(
-            lambda x: jax.device_put(x, model_sharding) if eqx.is_array(x) else x,
-            model_ema,
-        )
-
         step_start = checkpoint_manager.latest_step()
 
         del restored
@@ -433,8 +393,6 @@ def main(cfg: DictConfig):
             lambda x: jnp.copy(x) if eqx.is_inexact_array(x) else x, model
         )
         state = (model, opt_state)
-        state = eqx.filter_shard(state, model_sharding)
-        model_ema = eqx.filter_shard(model_ema, model_sharding)
 
     vae = hydra.utils.instantiate(cfg.vae).to("cpu")
 
@@ -445,8 +403,6 @@ def main(cfg: DictConfig):
         data_iterator,
         vae,
         cfg,
-        model_sharding,
-        data_sharding,
         key,
         checkpoint_manager,
         step_start,
