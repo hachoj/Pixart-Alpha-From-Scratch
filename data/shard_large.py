@@ -118,7 +118,7 @@ ds = split_dataset_by_node(ds, rank=args.rank, world_size=args.world_size)
 dataloader = DataLoader(
     ds,  # pyrefly:ignore
     batch_size=BATCH_SIZE,
-    num_workers=1,
+    num_workers=3,
     pin_memory=False,
     prefetch_factor=2,
 )

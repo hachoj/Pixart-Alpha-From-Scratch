@@ -23,16 +23,16 @@ for path in tqdm(os.listdir(base_dir)):
     num = path.split("_")[-2].split(".")[0]
     try:
         array_record_data_source = grain.sources.ArrayRecordDataSource(new_path)
-        # for data in array_record_data_source:
-        #     element = pickle.loads(data)
-        #     writer.write(pickle.dumps(element))
-        #     current_record_count += 1
-            # if current_record_count >= records_per_shard:
-            #     writer.close()
-            #     shard_number += 1                
-            #     current_record_count = 0
-            #     write_path = f"data/common_canvas_{shard_number}.array_record"
-            #     writer = array_record_module.ArrayRecordWriter(write_path, "group_size:1")
+        for data in array_record_data_source:
+            element = pickle.loads(data)
+            writer.write(pickle.dumps(element))
+            current_record_count += 1
+            if current_record_count >= records_per_shard:
+                writer.close()
+                shard_number += 1                
+                current_record_count = 0
+                write_path = f"data/common_canvas_{shard_number}.array_record"
+                writer = array_record_module.ArrayRecordWriter(write_path, "group_size:1")
     except:
         invalid_records[num] = True
 
