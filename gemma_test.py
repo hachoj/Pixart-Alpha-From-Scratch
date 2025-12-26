@@ -15,6 +15,5 @@ input_ids = tokenizer(
     input_texts, padding=True, truncation=True, max_length=100, return_tensors="pt"
 ).to("cuda")
 
-
 torch_model = model.model
 print(torch_model.encoder(**input_ids).last_hidden_state.shape)
