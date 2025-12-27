@@ -1,24 +1,23 @@
-import os
-import torch
-from torch import Tensor
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.amp import autocast
 import copy
+import gc
+import os
+import time
 
 import hydra
-from omegaconf import DictConfig
-import wandb
-import time
-import gc
-
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
 import torchdiffeq
+import wandb
 from einops import rearrange, repeat
+from omegaconf import DictConfig
+from torch import Tensor
+from torch.amp import autocast
+from torch.distributed import destroy_process_group, init_process_group
 
 # DDP Code
 from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
-from torch.distributed import init_process_group, destroy_process_group
 
 
 def param_groups_weight_decay(
@@ -180,10 +179,12 @@ def train(
         optimizer.step()
 
         if cfg.wandb.enabled and (step + 1) % cfg.train.every_n_steps == 0 and is_main:
+            loss_detached = loss.detach()
+            dist.all_reduce(loss_detached, op=dist.ReduceOp.AVG)
             wandb.log(
                 {
                     "train_step": step + 1,
-                    "train/loss": loss,
+                    "train/loss": loss_detached.item(),
                 }
             )
         if (step + 1) % cfg.train.every_n_ema == 0:
