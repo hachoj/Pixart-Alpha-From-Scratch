@@ -7,20 +7,20 @@ from torch.utils.data import IterableDataset, get_worker_info
 
 
 class LatentShardDatasetStage1(IterableDataset):
-    def __init__(self, shard_paths, base_seed=0):
-        self.shard_paths = list(shard_paths)
-        self.base_seed = base_seed
+    def __init__(self, shard_paths, seed=0):
+        self.shard_paths = shard_paths
+        self.seed = seed
 
     def __iter__(self):
-        # ----- DDP info -----
+        # --- DDP Setup ---
         if dist.is_available() and dist.is_initialized():
             rank = dist.get_rank()
             world_size = dist.get_world_size()
         else:
-            rank = 0
-            world_size = 1
+            rank: int = 0
+            world_size: int = 1
 
-        # ----- Worker info -----
+        # --- Workers Setup ---
         worker = get_worker_info()
         if worker is None:
             worker_id = 0
@@ -29,54 +29,52 @@ class LatentShardDatasetStage1(IterableDataset):
             worker_id = worker.id
             num_workers = worker.num_workers
 
-        # ----- Shard ownership -----
+        # --- Distriute Shards ---
 
-        # First split the shards into groups based on the number of workers
         rank_shards = self.shard_paths[rank::world_size]
+        worker_shards = rank_shards[worker_id::num_workers]
 
-        # Then split the shards within a rank by the number of workers
-        my_shards = rank_shards[worker_id::num_workers]
-
-        if len(my_shards) == 0:
+        if len(worker_shards) == 0:
             raise RuntimeError("No shards assigned to this worker")
 
         epoch = 0
 
+        # infinite dataset
         while True:
-            rng = random.Random(
-                self.base_seed + epoch * 1000 + rank * 100 + worker_id
-            )
+            rng = random.Random(self.seed + epoch * 1000 + rank * 100 + worker_id)
 
-            rng.shuffle(my_shards)
+            rng.shuffle(worker_shards)
 
-            for shard_path in my_shards:
+            for shard_path in worker_shards:
                 data = torch.load(shard_path, map_location="cpu")
-                latents = data["latents"]   # bf16 tensor [N, 16, 32, 32]
-                labels = data["labels"]     # int tensor [N]
 
-                indices = list(range(len(latents)))
-                rng.shuffle(indices)
+                latents = data['latents']
+                labels = data['labels']
 
-                for i in indices:
-                    yield latents[i], labels[i]
+                idx = list(range(len(latents)))
+                rng.shuffle(idx)
 
+                for i in idx:
+                    yield (latents[i], labels[i])
+                
             epoch += 1
+            
 
 class LatentShardDatasetStage2(IterableDataset):
-    def __init__(self, shard_paths, base_seed=0):
-        self.shard_paths = list(shard_paths)
-        self.base_seed = base_seed
+    def __init__(self, shard_paths, seed=0):
+        self.shard_paths = shard_paths
+        self.seed = seed
 
     def __iter__(self):
-        # ----- DDP info -----
+        # --- DDP Setup ---
         if dist.is_available() and dist.is_initialized():
             rank = dist.get_rank()
             world_size = dist.get_world_size()
         else:
-            rank = 0
-            world_size = 1
+            rank: int = 0
+            world_size: int = 1
 
-        # ----- Worker info -----
+        # --- Workers Setup ---
         worker = get_worker_info()
         if worker is None:
             worker_id = 0
@@ -85,35 +83,35 @@ class LatentShardDatasetStage2(IterableDataset):
             worker_id = worker.id
             num_workers = worker.num_workers
 
-        # ----- Shard ownership -----
+        # --- Distriute Shards ---
 
-        # First split the shards into groups based on the number of workers
         rank_shards = self.shard_paths[rank::world_size]
+        worker_shards = rank_shards[worker_id::num_workers]
 
-        # Then split the shards within a rank by the number of workers
-        my_shards = rank_shards[worker_id::num_workers]
-
-        if len(my_shards) == 0:
+        if len(worker_shards) == 0:
             raise RuntimeError("No shards assigned to this worker")
 
         epoch = 0
 
+        # infinite dataset
         while True:
-            rng = random.Random(
-                self.base_seed + epoch * 1000 + rank * 100 + worker_id
-            )
+            rng = random.Random(self.seed + epoch * 1000 + rank * 100 + worker_id)
 
-            rng.shuffle(my_shards)
+            rng.shuffle(worker_shards)
 
-            for shard_path in my_shards:
+            for shard_path in worker_shards:
                 data = torch.load(shard_path, map_location="cpu")
-                latents = data["latents"]   # bf16 tensor [N, 16, 32, 32]
-                labels = data["labels"]     # int tensor [N]
 
-                indices = list(range(len(latents)))
-                rng.shuffle(indices)
+                latents = data['latents']
+                short_captions = data['short_captions']
+                long_captions = data['long_captions']
 
-                for i in indices:
-                    yield latents[i], labels[i]
+                idx = list(range(len(latents)))
+                rng.shuffle(idx)
 
+                for i in idx:
+                    yield (latents[i], short_captions[i], long_captions[i])
+                
             epoch += 1
+            
+
