@@ -19,6 +19,11 @@ from torch.distributed import destroy_process_group, init_process_group
 # DDP Code
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from data.data import LatentShardDatasetStage1
+
+# Dataloader
+
+
 
 def param_groups_weight_decay(
     model: nn.Module,
@@ -293,16 +298,19 @@ def train(
 def main(cfg: DictConfig):
     # setup DDP
     dist.init_process_group(backend="nccl")  # nvidia collective communications library
-    local_rank = int(os.environ["LOCAL_RANK"])  # this is given by torchrun 
-    world_size = int(os.environ["WORLD_SIZE"])  # also given by torchrun
-    rank = int(os.environ["RANK"])  # also from torchrun
+    local_rank = dist.get_node_local_rank()
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
     # world_size and rank are redundant on one node but good practice
     is_main: bool = True if rank == 0 else False
 
     torch.cuda.set_device(local_rank)
     device = torch.device('cuda', local_rank)
 
-    dataloader = hydra.utils.instantiate(cfg.data)
+    data_dir = cfg.data.data_dir
+    shard_names = os.listdir(data_dir)
+    shard_paths = [os.path.join(data_dir,shard_name) for shard_name in shard_names]
+    dataloader = LatentShardDatasetStage1(shard_paths=shard_paths)
     dataiter = iter(dataloader)
 
     model = hydra.utils.instantiate(cfg.model)

@@ -1,53 +1,45 @@
-from array_record.python import array_record_module  #pyrefly:ignore
-import pickle
-import grain
-from tqdm import tqdm
 import os
+import pickle
 
+import grain
 import torch
-print("importing diffusers")
-from diffusers.models import AutoencoderKL
-print("imported diffusers")
-
-
-vae = AutoencoderKL.from_pretrained(
-    "stabilityai/stable-diffusion-3-medium-diffusers",
-    subfolder="vae",
-    torch_dtype=torch.bfloat16,
-)
-
+from array_record.python import array_record_module  # pyrefly:ignore
+from jaxtyping import Float
+from torch import Tensor
+from tqdm import tqdm
 
 base_dir = os.path.abspath("data/datasets")
 
 records_per_shard: int = 50000
 shard_number: int = 0
 
-for path in tqdm(os.listdir(base_dir)):
-    new_path = os.path.join(base_dir, path)
-    try:
-        array_record_data_source = grain.sources.ArrayRecordDataSource(new_path)
-        for data in array_record_data_source:
-            element = pickle.loads(data)
-            latent = element['latent']
-            label = element['label']
-            latent = torch.from_numpy(latent).view(torch.bfloat16)
-            latent = latent.unsqueeze(0)
-            img = vae.decode(latent)[0]
-            img = img.squeeze(0).permute(1, 2, 0).clip(0, 1).mult_(255.0).numpy()
-            import matplotlib.pyplot as plt
-            plt.imshow(img)
-            plt.savefig("test.png")
-            print(img.shape)
-            print(latent.shape, latent.dtype)
-            print(label.shape, label.dtype)
-            break
-            # writer.write(pickle.dumps(element))
-            # current_record_count += 1
-            # if current_record_count >= records_per_shard:
-            #     writer.close()
-            #     shard_number += 1                
-            #     current_record_count = 0
-            #     write_path = f"data/common_canvas_{shard_number}.array_record"
-            #     writer = array_record_module.ArrayRecordWriter(write_path, "group_size:1")
-    except:
-        raise ValueError("invalid record")
+latents: list[Tensor] = []
+labels: list[int] = []
+
+print(base_dir)
+print(os.listdir(base_dir))
+# for path in tqdm(os.listdir(base_dir)):
+    # new_path = os.path.join(base_dir, path)
+    # buf = torch.empty((records_per_shard, 16, 32, 32), dtype=torch.bfloat16)
+    # lbl = torch.empty((records_per_shard,))
+    # try:
+    #     array_record_data_source = grain.sources.ArrayRecordDataSource(new_path)
+    #     i = 0
+    #     for data in tqdm(array_record_data_source):
+    #         if i >= records_per_shard:
+    #             save_path = os.path.join(base_dir, f"shard_{shard_number:0{6}d}.pt")
+    #             torch.save({"latents": buf, "labels": lbl}, save_path)
+    #             shard_number += 1
+    #             i = 0
+    #             buf = torch.empty((records_per_shard, 16, 32, 32), dtype=torch.bfloat16)
+    #             lbl = torch.empty((records_per_shard,))
+    #         element = pickle.loads(data)
+    #         latent = element["latent"]
+    #         label: int = element["label"]
+    #         latent: Float[Tensor, "C H W"] = torch.from_numpy(latent).view(torch.bfloat16)
+    #         buf[i] = latent 
+    #         lbl[i] = label
+    #         i += 1
+
+    # except:
+    #     raise ValueError("invalid record")
