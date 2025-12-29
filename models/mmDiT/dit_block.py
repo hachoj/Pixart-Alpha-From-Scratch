@@ -11,6 +11,7 @@ from ..mlp import MLP
 
 class DiTBlock(nn.Module):
     def __init__(self, dim, text_dim, num_heads, mlp_ratio):
+        super().__init__()
         self.attention = MHSA(dim, num_heads)
         self.cross_attention = QKNormedAttention(
             num_heads=num_heads,

@@ -9,6 +9,7 @@ class linearOut(nn.Linear):
 
 class MLP(nn.Module):
     def __init__(self, dim: int, mlp_ratio: int):
+        super().__init__()
         self.layer_norm = nn.LayerNorm(dim, elementwise_affine=False, bias=False)
 
         hidden_dim = dim * mlp_ratio
@@ -28,11 +29,11 @@ class MLP(nn.Module):
 
         residual = x
         x = self.layer_norm(x)
-        x = x * (1 + gamma) + beta
+        x = x * (1 + gamma[:, None, :]) + beta[:, None, :]
         x = self.linear1(x)
         x = self.act(x)
         x = self.linear2(x)
-        return alpha * x + residual
+        return alpha[:, None, :] * x + residual
 
     def _init_weights(self, m: nn.Module) -> None:
         if isinstance(m, linearOut):

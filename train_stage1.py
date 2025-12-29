@@ -1,6 +1,7 @@
 import copy
 import gc
 import os
+import re
 import time
 from typing import cast
 
@@ -60,6 +61,7 @@ def ema_scheduler(decay, init_decay, step, warmup_steps):
         return ((decay - init_decay) / warmup_steps) * step + init_decay
 
 
+@torch.no_grad()
 def update_ema(model_ema, model, decay):
     sd = model.module.state_dict()
     ema_sd = model_ema.state_dict()
@@ -87,15 +89,24 @@ def single_sample_fn(model, noise, label, num_steps=24, num_save_steps=6):
     return samples[0]
 
 
+@torch.inference_mode()
 def generate_samples(model, noise, labels, num_steps=24, num_save_steps=6):
     labels = labels.to(device=noise.device)
-    save_times = torch.linspace(
-        0.0, 1.0, num_save_steps, device=noise.device
-    )
+    save_times = torch.linspace(0.0, 1.0, num_save_steps, device=noise.device)
 
     def vector_field(t, y):
         t_batch = torch.full((y.shape[0],), t, device=y.device, dtype=y.dtype)
-        return model(y, t_batch, labels).to(y.dtype)
+        # Sampling is called outside the training autocast context.
+        # If `noise`/`y` is BF16 but model params are FP32, Conv2d will error
+        # (input BF16 vs bias FP32). Run forward under autocast on CUDA and
+        # cast back to the ODE state's dtype.
+        with autocast(
+            device_type=y.device.type,
+            dtype=torch.bfloat16,
+            enabled=(y.device.type == "cuda"),
+        ):
+            out = model(y, t_batch, labels)
+        return out.to(y.dtype)
 
     sol = torchdiffeq.odeint(
         vector_field,
@@ -136,6 +147,7 @@ def train(
                 "batch_size": cfg.train.batch_size,
             },
             name=cfg.wandb.name,
+            group="torch",
         )
         wandb.define_metric("train_step")
         wandb.define_metric("train/*", step_metric="train_step")
@@ -147,8 +159,10 @@ def train(
     validation_labels = None
     if is_main:
         validation_noise = torch.randn(
-            (8, 16, 32, 32), dtype=torch.bfloat16, device=device
+            (1, 16, 32, 32), dtype=torch.float32, device=device
         )
+        validation_noise = repeat(validation_noise, "1 ... -> b ...", b=8)
+
         # ImageNet-1K labels:
         # 2   = great white shark
         # 316 = praying mantis
@@ -172,8 +186,8 @@ def train(
         # the non blocking means that the CPU can keep working while
         # loading the data onto the GPU, basically just a speed up that
         # required pin memory also to be True
-        latents = batch["latent"].to(device=device, non_blocking=True)
-        labels = batch["label"].to(device=device, non_blocking=True)
+        latents = batch[0].to(device=device, non_blocking=True)
+        labels = batch[1].to(device=device, non_blocking=True, dtype=torch.long)
 
         B = latents.shape[0]
 
@@ -230,7 +244,7 @@ def train(
         if (step + 1) % cfg.train.every_n_checkpoint == 0 and is_main:
             save_dir = os.path.abspath(cfg.train.checkpoint_dir)
             os.makedirs(save_dir, exist_ok=True)
-            save_path = os.path.join(save_dir, f"model_{step}.pt")
+            save_path = os.path.join(save_dir, f"model_{step + 1}.pt")
             torch.save(
                 {
                     "model": model.module.state_dict(),
@@ -240,9 +254,29 @@ def train(
                 },
                 save_path,
             )
+            # Remove anything more than 5 checkpoints (keep highest step numbers).
+            # Only considers files matching model_<int>.pt in the checkpoint dir.
+            checkpoints = []
+            for fname in os.listdir(save_dir):
+                m = re.fullmatch(r"model_(\d+)\.pt", fname)
+                if m is None:
+                    continue
+                checkpoints.append((int(m.group(1)), os.path.join(save_dir, fname)))
+
+            if len(checkpoints) > 5:
+                checkpoints.sort(key=lambda x: x[0])  # ascending by step
+                to_delete = checkpoints[: max(0, len(checkpoints) - 5)]
+                for _, path in to_delete:
+                    try:
+                        os.remove(path)
+                    except FileNotFoundError:
+                        pass
+
         if cfg.wandb.enabled and (step + 1) % cfg.train.every_n_image == 0 and is_main:
+            print("------------------------------")
+            print(f" VAE device: {next(vae.parameters()).device}")
+            print("------------------------------")
             assert validation_noise is not None and validation_labels is not None
-            end_time = time.time()
             with torch.inference_mode():
                 generated_latents_ema = generate_samples(
                     model_ema,
@@ -260,17 +294,22 @@ def train(
             generated_latents_model = (
                 generated_latents_model + cfg.train.latent_mean
             ) / vae.config.scaling_factor
+
+            # Ensure VAE decode inputs match the VAE's device/dtype.
+            vae_param = next(vae.parameters())
+            vae_device = vae_param.device
+            vae_dtype = vae_param.dtype
             generated_latents_ema = generated_latents_ema.to(
-                "cpu", dtype=torch.bfloat16
+                device=vae_device, dtype=vae_dtype
             )
             generated_latents_model = generated_latents_model.to(
-                "cpu", dtype=torch.bfloat16
+                device=vae_device, dtype=vae_dtype
             )
             decode_start_time = time.time()
 
             # [B,T,C,H,W]
-            generated_latents_ema = generated_latents_ema.view(-1, 16, 32, 32)
-            generated_latents_model = generated_latents_model.view(-1, 16, 32, 32)
+            generated_latents_ema = generated_latents_ema.reshape(-1, 16, 32, 32)
+            generated_latents_model = generated_latents_model.reshape(-1, 16, 32, 32)
             with torch.inference_mode():
                 decoded_images_ema = vae.decode(generated_latents_ema)[0]
                 decoded_images_model = vae.decode(generated_latents_model)[0]
@@ -286,20 +325,19 @@ def train(
             )
 
             decoded_images_ema = (
-                decoded_images_ema.permute(1, 2, 0).clamp(0, 1).float().numpy()
+                decoded_images_ema.permute(1, 2, 0).clamp(0, 1).float().cpu().numpy()
                 * 255.0
             )
             decoded_images_model = (
-                decoded_images_model.permute(1, 2, 0).clamp(0, 1).float().numpy()
+                decoded_images_model.permute(1, 2, 0).clamp(0, 1).float().cpu().numpy()
                 * 255.0
             )
             decoded_images = np.concatenate(
                 [decoded_images_ema, decoded_images_model], axis=1
             ).astype(np.uint8)
 
-            print(
-                f"Time to decode latents fully on cpu: {(time.time() - decode_start_time):.4f} s."
-            )
+            print(f"Time to decode latents: {(time.time() - decode_start_time):.4f} s.")
+            end_time = time.time()
             if start_time is not None:
                 wandb.log(
                     {f"train/{cfg.train.every_n_image} time": end_time - start_time}
@@ -311,9 +349,7 @@ def train(
                 "551 espresso maker; 804 snowplow; 981 volcano; 984 scuba diver; "
                 "1000 null"
             )
-            wandb.log(
-                {"image/examples": wandb.Image(decoded_images, caption=caption)}
-            )
+            wandb.log({"image/examples": wandb.Image(decoded_images, caption=caption)})
             start_time = time.time()
 
         if step >= cfg.train.total_steps:
@@ -323,20 +359,22 @@ def train(
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig):
     # setup DDP
-    dist.init_process_group(backend="nccl")  # nvidia collective communications library
-    local_rank = dist.get_node_local_rank()
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
     # world_size and rank are redundant on one node but good practice
     is_main: bool = True if rank == 0 else False
 
     torch.cuda.set_device(local_rank)
+
+    dist.init_process_group(backend="nccl", init_method="env://")  # nvidia collective communications library
+
     device = torch.device("cuda", local_rank)
 
     data_dir = cfg.data.data_dir
-    shard_names = os.listdir(data_dir)
+    shard_names = sorted(os.listdir(data_dir))  # For determinism accross nodes
     shard_paths = [os.path.join(data_dir, shard_name) for shard_name in shard_names]
-    dataset = LatentShardDatasetStage1(shard_paths=shard_paths, base_seed=cfg.data.seed)
+    dataset = LatentShardDatasetStage1(shard_paths=shard_paths, seed=cfg.data.seed)
     dataloader = DataLoader(
         dataset,
         batch_size=cfg.data.batch_size,
@@ -357,7 +395,9 @@ def main(cfg: DictConfig):
     if os.path.exists(cfg.train.resume_path) and cfg.train.is_restore:
         model_ema = copy.deepcopy(model)
 
-        resume_dict = torch.load(os.path.abspath(cfg.train.resume_path), map_location="cpu")
+        resume_dict = torch.load(
+            os.path.abspath(cfg.train.resume_path), map_location="cpu"
+        )
 
         model.load_state_dict(resume_dict["model"])
         model_ema.load_state_dict(resume_dict["model_ema"])
@@ -367,12 +407,25 @@ def main(cfg: DictConfig):
         model_ema = copy.deepcopy(model)
 
     vae = hydra.utils.instantiate(cfg.vae)
+    # Keep VAE on CPU (used only for logging/decoding).
+    vae = vae.to(device="cpu")
+    if is_main:
+        print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
+        vae = vae.to(device=device)
+        print(f"VAE number of parameters: {sum(p.numel() for p in vae.parameters())}")
 
     # move to devices
     model = model.to(device=device)
     # model = torch.compile(model)
     model_ema = model_ema.to(device=device)
     model = DDP(model, device_ids=[local_rank])
+
+    for param in model_ema.parameters():
+        param.requires_grad = False
+    for param in vae.parameters():
+        param.requires_grad = False
+    model_ema.eval()
+    vae.eval()
 
     train(
         model,
@@ -387,7 +440,6 @@ def main(cfg: DictConfig):
     )
 
     dist.destroy_process_group()  # DDP cleanup
-
 
 if __name__ == "__main__":
     main()

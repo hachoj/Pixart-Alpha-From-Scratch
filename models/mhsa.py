@@ -8,6 +8,7 @@ from .attention import QKNormedAttention
 
 class MHSA(nn.Module):
     def __init__(self, dim, num_heads):
+        super().__init__()
         assert dim % num_heads == 0, "Dimension must be divisible by num_heads"
         self.layer_norm = nn.LayerNorm(dim, elementwise_affine=False, bias=False)
         self.attention = QKNormedAttention(num_heads, dim, dim, dim)
@@ -22,6 +23,6 @@ class MHSA(nn.Module):
 
         residual = x
         x = self.layer_norm(x)
-        x = x * (1 + gamma) + beta
+        x = x * (1 + gamma[:, None, :]) + beta[:, None, :]
         x = self.attention(query=x, key=x, value=x)
-        return alpha * x + residual
+        return alpha[:, None, :] * x + residual

@@ -41,6 +41,9 @@ class SinusoidalPosEmbed(nn.Module):
         self.base_size = base_size
         self.patch_size = patch_size
 
+        # Express the training/reference resolution in *patch-grid* units.
+        self.base_grid = base_size // patch_size
+
         half_dim = dim // 2
         div_term = torch.exp(
             -torch.log(torch.tensor(10000.0)) * torch.arange(0, half_dim, 2) / half_dim
@@ -48,11 +51,11 @@ class SinusoidalPosEmbed(nn.Module):
         self.register_buffer("div_term", div_term)
 
     def forward(self, h: int, w: int) -> Float[Tensor, "1 n dim"]:
-        grid_h = h // self.patch_size
-        grid_w = w // self.patch_size
+        # `h`, `w` are patch-grid sizes (number of tokens along height/width).
+        grid_h, grid_w = h, w
 
-        scale_h = (self.base_size // self.patch_size) / grid_h
-        scale_w = (self.base_size // self.patch_size) / grid_w
+        scale_h = self.base_grid / grid_h
+        scale_w = self.base_grid / grid_w
 
         device = self.div_term.device
         dtype = self.div_term.dtype
@@ -99,6 +102,7 @@ class DiT(nn.Module):
         num_classes,
         base_image_size,
     ):
+        super().__init__()
         self.patchify = nn.Conv2d(
             in_dim,
             dim,
@@ -134,7 +138,7 @@ class DiT(nn.Module):
         t: Float[Tensor, "b"],
         label: Int[Tensor, "b"],
     ) -> Float[Tensor, "b in_dim height width"]:
-        H, W = x.shape[:-2]
+        H, W = x.shape[-2:]
         p = self.p
         h = H // p
         w = W // p
@@ -162,11 +166,11 @@ class DiT(nn.Module):
         cond: Float[Tensor, "b 2*ebmed_dim"] = self.adaLN2(cond)
         gamma, beta = torch.chunk(cond, 2, dim=-1)
 
-        x: Float[Tensor, "b num_patches embed_dim"] = x * (1 + gamma) + beta
+        x: Float[Tensor, "b num_patches embed_dim"] = x * (1 + gamma[:, None, :]) + beta[:, None, :]
 
         x: Float[Tensor, "b num_patches 3*p*p"] = self.linear_out(x)
         x: Float[Tensor, "b 3 h w"] = rearrange(
-            x, "(h w) (p1 p2 c) -> c (h p1) (w p2)", h=h, w=w, p1=p, p2=p
+            x, "b (h w) (p1 p2 c) -> b c (h p1) (w p2)", h=h, w=w, p1=p, p2=p
         )
 
         return x

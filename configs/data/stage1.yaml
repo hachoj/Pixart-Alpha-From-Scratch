@@ -1,5 +1,5 @@
 _target_: data.data.create_dataloader_stage_1
 data_dir: data/stage1/
-num_workers: 32
+num_workers: 2
 batch_size: ${train.batch_size}
 seed: ${train.seed}

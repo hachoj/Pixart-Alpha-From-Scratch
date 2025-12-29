@@ -1,6 +1,6 @@
 defaults:
   - data: stage1
-  - model: mmdit
+  - model: ccdit
   - train: stage1
   - vae: vae
   - optim: adamw

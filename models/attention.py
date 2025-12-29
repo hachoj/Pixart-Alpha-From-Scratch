@@ -17,6 +17,7 @@ class QKNormedAttention(nn.Module):
         in_kv_dim,
         query_dim,
     ):
+        super().__init__()
         assert (
             query_dim % num_heads == 0
         ), "Query dimension must be divisible by num_heads"

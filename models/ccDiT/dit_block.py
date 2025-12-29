@@ -13,6 +13,7 @@ class adaLNOut(nn.Linear):
 
 class DiTBlock(nn.Module):
     def __init__(self, dim, cond_dim, num_heads, mlp_ratio):
+        super().__init__()
         self.attention = MHSA(dim, num_heads)
         self.mlp = MLP(dim, mlp_ratio)
 

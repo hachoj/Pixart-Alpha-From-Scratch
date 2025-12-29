@@ -1,5 +1,5 @@
 total_steps: 300000
-batch_size: 1024
+batch_size: 128
 every_n_steps: 10
 every_n_image: 5000
 every_n_checkpoint: 1000
