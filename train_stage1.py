@@ -416,7 +416,7 @@ def main(cfg: DictConfig):
 
     # move to devices
     model = model.to(device=device)
-    # model = torch.compile(model)
+    model = torch.compile(model)
     model_ema = model_ema.to(device=device)
     model = DDP(model, device_ids=[local_rank])
 

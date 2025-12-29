@@ -1,93 +1,60 @@
+import copy
+import gc
 import os
-
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
-
-import jax
-import jax.numpy as jnp
-import jax.random as jr
-import jax.sharding as jshard
-import orbax.checkpoint as ocp
-import equinox as eqx
-import optax
-import numpy as np
-import grain.python as grain
+import re
+import time
+from typing import cast
 
 import hydra
-from omegaconf import DictConfig
-import wandb
-import time
-
-import diffrax
-from einops import rearrange
+import numpy as np
 import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+import torchdiffeq
+import wandb
+from einops import rearrange, repeat
+from omegaconf import DictConfig
+from torch import Tensor
+from torch.amp import autocast
+from torch.distributed import destroy_process_group, init_process_group
 
-from typing import Union, Sequence
-from jaxtyping import Array, Float, Bool, Int
+# DDP Code
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+
+# Dataloader
+from data.data import LatentShardDatasetStage1
+
+# Gemma
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 
-def encode_with_t5gemma_encoder(
-    texts: Union[str, Sequence[str]],
-    *,
-    model=None,
-    params,
-    tokenizer,
-    max_input_length: int = 256,
-    model_sharding: jshard.NamedSharding,
-    data_sharding: jshard.NamedSharding,
-    return_on_host: bool = True,
-    forward_fn=None,
-) -> tuple[Float[Array, "batch max_length d_model"], Bool[Array, "batch max_length"]]:
-    if isinstance(texts, str):
-        texts = [texts]
+def param_groups_weight_decay(
+    model: nn.Module,
+    weight_decay: float,
+):
+    decay = []
+    no_decay = []
 
-    if hasattr(tokenizer, "special_tokens"):
-        pad_id = tokenizer.special_tokens.PAD
-    else:
-        raise ValueError("Expected PAD token to exist")
+    for module_name, module in model.named_modules():
+        for param_name, param in module.named_parameters(recurse=False):
+            if not param.requires_grad:
+                continue
 
-    padded_batch = []
-    for text in texts:
-        token_ids = tokenizer.encode(text)[:max_input_length]
-        padded_batch.append(token_ids + [pad_id] * (max_input_length - len(token_ids)))
+            full_name = f"{module_name}.{param_name}" if module_name else param_name
 
-    input_tokens: Int[Array, "batch max_length"] = jnp.asarray(
-        padded_batch, dtype=jnp.int32
-    )
+            if isinstance(module, (nn.LayerNorm, nn.RMSNorm, nn.Embedding)):
+                no_decay.append(param)
+            elif param_name == "bias":
+                no_decay.append(param)
+            else:
+                decay.append(param)
 
-    # Padding-based mask.
-    inputs_mask: Bool[Array, "batch max_length"] = input_tokens != pad_id
-
-    params_s = jax.device_put(params, model_sharding)
-    tokens_s = jax.device_put(input_tokens, data_sharding)
-    mask_s = jax.device_put(inputs_mask, data_sharding)
-
-    if forward_fn is not None:
-        encoder_last_hidden = forward_fn(params_s, tokens_s, mask_s)
-    else:
-        if model is None:
-            raise ValueError("model must be provided if forward_fn is not provided")
-
-        def _encoder_last_hidden(params, tokens, mask):
-            encoder_acts = model.apply(
-                {"params": params},
-                tokens=tokens,
-                inputs_mask=mask,
-                method=model.compute_encoder_activations,
-            )
-            return encoder_acts.activations[-1]  # [B, L, d_model]
-
-        forward = jax.jit(
-            _encoder_last_hidden,
-            in_shardings=(model_sharding, data_sharding, data_sharding),
-            out_shardings=data_sharding,
-        )
-        encoder_last_hidden = forward(params_s, tokens_s, mask_s)
-
-    if return_on_host:
-        encoder_last_hidden = jax.device_get(encoder_last_hidden)
-        inputs_mask = jax.device_get(inputs_mask)
-    return encoder_last_hidden, inputs_mask
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
 
 
 def ema_scheduler(decay, init_decay, step, warmup_steps):
@@ -97,168 +64,87 @@ def ema_scheduler(decay, init_decay, step, warmup_steps):
         return ((decay - init_decay) / warmup_steps) * step + init_decay
 
 
-@eqx.filter_jit(donate="all")
-def update_ema(model_ema, model_train, decay):
-    mask = get_trainable_mask(model_ema)
-    params_ema, static_ema = eqx.partition(model_ema, mask)
-    params_train, _ = eqx.partition(model_train, mask)
+@torch.no_grad()
+def update_ema(model_ema, model, decay):
+    sd = model.module.state_dict()
+    ema_sd = model_ema.state_dict()
 
-    step_size = 1.0 - decay
-    params_ema = optax.incremental_update(params_train, params_ema, step_size)
+    for k, v in sd.items():
+        if v.dtype.is_floating_point:
+            ema_sd[k].mul_(decay).add_(v * (1 - decay))
 
-    return eqx.combine(params_ema, static_ema)
+    return model_ema
 
 
-def get_trainable_mask(model):
-    mask = jax.tree_util.tree_map(eqx.is_inexact_array, model)
+def single_sample_fn(model, noise, label, num_steps=24, num_save_steps=6):
+    if noise.dim() == 3:
+        noise = noise.unsqueeze(0)
+    if label.dim() == 0:
+        label = label.unsqueeze(0)
 
-    mask = eqx.tree_at(
-        lambda m: [m.pos_embed.emb, m.time_proj.emb], mask, replace=(False, False)
+    samples = generate_samples(
+        model,
+        noise,
+        label,
+        num_steps=num_steps,
+        num_save_steps=num_save_steps,
     )
-    return mask
+    return samples[0]
 
 
-def single_sample_fn(model, noise, text_tokens, token_mask):
-    def vector_field(t, y, args):
-        model, text_tokens, token_mask = args
-        return model(y, t, text_tokens, token_mask)
+@torch.inference_mode()
+def generate_samples(model, noise, labels, num_steps=24, num_save_steps=6):
+    labels = labels.to(device=noise.device)
+    save_times = torch.linspace(0.0, 1.0, num_save_steps, device=noise.device)
 
-    term = diffrax.ODETerm(vector_field)
+    def vector_field(t, y):
+        t_batch = torch.full((y.shape[0],), t, device=y.device, dtype=y.dtype)
+        # Sampling is called outside the training autocast context.
+        # If `noise`/`y` is BF16 but model params are FP32, Conv2d will error
+        # (input BF16 vs bias FP32). Run forward under autocast on CUDA and
+        # cast back to the ODE state's dtype.
+        with autocast(
+            device_type=y.device.type,
+            dtype=torch.bfloat16,
+            enabled=(y.device.type == "cuda"),
+        ):
+            out = model(y, t_batch, labels)
+        return out.to(y.dtype)
 
-    solver = diffrax.Euler()
-
-    num_steps = 24
-    stepsize_controller = diffrax.ConstantStepSize()
-    save_times = jnp.linspace(0.0, 1.0, 6)
-
-    sol = diffrax.diffeqsolve(
-        term,
-        solver,
-        t0=0.0,
-        t1=1.0,
-        dt0=1.0 / num_steps,
-        y0=noise,
-        args=(model, text_tokens, token_mask),
-        stepsize_controller=stepsize_controller,
-        saveat=diffrax.SaveAt(ts=save_times),
-        max_steps=num_steps + 2,
-    )
-    return sol.ys
-
-
-@eqx.filter_jit
-def generate_samples(
-    model, noise, text_tokens, token_mask, model_sharding, data_sharding
-):
-    model = eqx.filter_shard(model, model_sharding)
-    noise, text_tokens, token_mask = eqx.filter_shard(
-        (noise, text_tokens, token_mask), data_sharding
-    )
-    return jax.vmap(single_sample_fn, in_axes=(None, 0, 0, 0))(
-        model, noise, text_tokens, token_mask
+    sol = torchdiffeq.odeint(
+        vector_field,
+        noise,
+        save_times,
+        method="euler",
+        options={"step_size": 1.0 / num_steps},
     )
 
+    # torchdiffeq returns a tuple when y0 is a tuple; unwrap single-state cases.
+    if isinstance(sol, tuple):
+        if len(sol) != 1:
+            raise TypeError(
+                f"Expected single-state solution tensor, got tuple of length {len(sol)}."
+            )
+        sol = sol[0]
 
-@eqx.filter_value_and_grad
-def compute_grads(params, static, x_t, v, t, text_tokens, token_mask):
-    model = eqx.combine(params, static)
-
-    logits = jax.vmap(model)(x_t, t, text_tokens, token_mask)
-    loss = optax.losses.l2_loss(logits, v)
-    return jnp.mean(loss)
-
-
-@eqx.filter_jit(
-    donate="all",
-)
-def step_model(
-    state,
-    optimizer,
-    x_t,
-    v,
-    t,
-    text_tokens,
-    token_mask,
-    model_sharding,
-    data_sharding,
-    micro_step,
-    grad_accum_steps,
-    gradients,
-):
-    # you shard again here for XLA efficiency, it doesn't
-    # actually divide the shards into smaller "sub-shards"
-
-    # model, opt_state = state
-    state = eqx.filter_shard(state, model_sharding)
-    model_fp32, opt_state = state
-    mask = get_trainable_mask(model_fp32)
-    params_fp32, static_fp32 = eqx.partition(model_fp32, mask)
-
-    # cast model weights to bf16
-    params_bf16 = jax.tree_util.tree_map(
-        lambda x: x.astype(jnp.bfloat16) if eqx.is_inexact_array(x) else x, params_fp32
-    )
-    static_bf16 = jax.tree_util.tree_map(
-        lambda x: x.astype(jnp.bfloat16) if eqx.is_inexact_array(x) else x, static_fp32
-    )
-
-    x_t, v, t, text_tokens, token_mask = eqx.filter_shard(
-        (x_t, v, t, text_tokens, token_mask), data_sharding
-    )
-    x_t, v, t, text_tokens = (
-        x_t.astype(jnp.bfloat16),
-        v.astype(jnp.bfloat16),
-        t.astype(jnp.bfloat16),
-        text_tokens.astype(jnp.bfloat16),
-    )
-
-    loss, grads = compute_grads(
-        params_bf16, static_bf16, x_t, v, t, text_tokens, token_mask
-    )
-
-    # Accumulate gradients
-    gradients = eqx.apply_updates(gradients, grads)
-
-    # use bf16 grads to update fp32 weights since bf16 should be stable enough
-    # without the use of grad scaling
-    def update_step(operands):
-        params_fp32, opt_state, gradients = operands
-        grads = jax.tree_util.tree_map(lambda g: g / grad_accum_steps, gradients)
-        updates, opt_state = optimizer.update(grads, opt_state, params=params_fp32)
-        params_fp32 = eqx.apply_updates(params_fp32, updates)
-
-        model_fp32 = eqx.combine(params_fp32, static_fp32)
-
-        zeros = jax.tree_util.tree_map(jnp.zeros_like, gradients)
-        return (model_fp32, opt_state), loss, zeros
-
-    def skip_step(operands):
-        params_fp32, opt_state, gradients = operands
-        model_fp32 = eqx.combine(params_fp32, static_fp32)
-        return (model_fp32, opt_state), loss, gradients
-
-    condition: bool = micro_step >= grad_accum_steps - 1
-    operands = (params_fp32, opt_state, gradients)
-    return jax.lax.cond(condition, update_step, skip_step, operands)
+    sol = cast(torch.Tensor, sol)
+    return sol.permute(1, 0, 2, 3, 4)
 
 
 def train(
-    state,
+    model,
     model_ema,
+    gemma,
+    tokenizer,
     optimizer,
-    data_iterator,
+    dataiter,
     vae,
     cfg,
-    model_sharding,
-    data_sharding,
-    key,
-    checkpoint_manager,
-    t5gemma_model,
-    t5gemma_params,
-    preset,
+    is_main,
+    device,
     step_start=0,
 ):
-    if cfg.wandb.enabled:
+    if cfg.wandb.enabled and is_main:
         wandb.init(
             project=cfg.wandb.project,
             config={  # optional; store hyperparameters
@@ -266,6 +152,7 @@ def train(
                 "batch_size": cfg.train.batch_size,
             },
             name=cfg.wandb.name,
+            group="torch",
         )
         wandb.define_metric("train_step")
         wandb.define_metric("train/*", step_metric="train_step")
@@ -273,214 +160,170 @@ def train(
 
     scaling_factor = vae.config.scaling_factor
 
-    key, sub_key = jr.split(key)
-
-    validation_captions = [
-        "A neon-lit vending machine in a dark alley.",
-        "A chrome skull resting on a velvet pillow.",
-        "The rain-slicked pavement of the neon metropolis reflects the holographic advertisements towering above, casting a kaleidoscope of electric blues and violent magentas onto the street. A lone figure in a transparent raincoat stands under a flickering awning, their face obscured by the glow of a datapad. Steam rises from a street vendor’s stall nearby, mingling with the dense fog that clings to the base of the skyscrapers. Drones buzz overhead like angry insects, their red navigation lights cutting through the gloom.",
-        "An ancient oak tree, its bark twisted into spirals of silver and grey, dominates the center of a twilight glade. Bioluminescent mushrooms in shades of teal and violet cling to its massive roots, casting an ethereal upward glow. The air is filled with floating pollen that glimmers like gold dust in the fading light. In the background, jagged crystal spires rise from the mist, piercing the purple sky where three pale moons hang low. A stream of crystal-clear water winds through the foreground, slipping over smooth, moss-covered stones.",
-        "The workshop is a cluttered labyrinth of brass gears, ticking clockwork mechanisms, and scattered blueprints stained with grease. A magnifying glass, mounted on an articulated brass arm, distorts the view of a tiny, mechanical beetle resting on the workbench. Dust motes dance in the shaft of warm, amber light streaming through a circular window, illuminating the particles of sawdust suspended in the air. Shelves line the walls, packed with glass jars containing preserved insects and spare springs.",
-        "A colossal space station shaped like a ring world creates a silhouette against the burning orange curve of a gas giant. Tiny shuttles leave trails of white exhaust as they approach the docking bays, looking like specks of dust against the massive scale of the station. The station’s lights twinkle like diamond dust, contrasting with the deep, velvet black of the surrounding void. A nebula in the distance swirls with hues of deep crimson and indigo, providing a dramatic backdrop to the industrial rigidity of the metal structure.",
-        "A warrior clad in ceremonial armor stands in a snowy courtyard, the metal plates etched with intricate floral patterns that catch the cold winter light. A fur cloak, heavy and textured with frost, drapes over their shoulders. Their eyes are sharp and piercing, reflecting the gray sky, while a scar runs faintly across their cheek. The background is a blur of falling snowflakes and dark pine trees, creating a soft bokeh effect that isolates the figure. The breath of the warrior is visible as a wisp of white vapor.",
-        "A floating island made of melting clocks and marble staircases drifts through a sky of liquid clouds. The staircases lead nowhere, twisting into loops and spirals that defy gravity. A grand piano sits on the edge of a precipice, its keys pouring out water instead of sound, creating a waterfall that cascades into the abyss below. The lighting is surreal, with two light sources casting shadows in opposing directions—one warm and golden, the other cool and teal. Giant butterflies with wings made of stained glass flutter around the piano.",
-    ]
-
-    # Shard T5 params across devices (Data Parallel / FSDP-style) to save memory
-    t5_sharding = model_sharding
-    t5gemma_params = jax.device_put(t5gemma_params, t5_sharding)
-
-    def _t5_forward(params, tokens, mask):
-        encoder_acts = t5gemma_model.apply(
-            {"params": params},
-            tokens=tokens,
-            inputs_mask=mask,
-            method=t5gemma_model.compute_encoder_activations,
+    validation_noise = None
+    validation_text = ["", ""]# TODO
+    if is_main:
+        validation_noise = torch.randn(
+            (1, 16, 32, 32), dtype=torch.float32, device=device
         )
-        return encoder_acts.activations[-1]
+        validation_noise = repeat(validation_noise, "1 ... -> b ...", b=8)
 
-    t5_forward_jit = jax.jit(
-        _t5_forward,
-        in_shardings=(t5_sharding, data_sharding, data_sharding),
-        out_shardings=data_sharding,
-    )
-
-    validation_tokens, validation_masks = encode_with_t5gemma_encoder(
-        validation_captions,
-        model=None,
-        params=t5gemma_params,
-        tokenizer=preset.tokenizer,
-        max_input_length=cfg.train.max_input_length,
-        model_sharding=t5_sharding,
-        data_sharding=data_sharding,
-        return_on_host=False,  # Keep them on device/sharded
-        forward_fn=t5_forward_jit,
-    )
-
-    validation_noise = jax.random.normal(key, shape=(1, 16, 32, 32), dtype=jnp.bfloat16)
-    validation_noise = jnp.repeat(validation_noise, repeats=8, axis=0)
-    validation_noise = eqx.filter_shard(validation_noise, data_sharding)
+        # ImageNet-1K labels:
+        # 2   = great white shark
+        # 316 = praying mantis
+        # 418 = hot air balloon
+        # 551 = espresso maker
+        # 804 = snowplow
+        # 981 = volcano
+        # 984 = scuba diver
+        validation_labels = torch.tensor(
+            [2, 316, 418, 551, 804, 981, 984, 1000], device=device
+        )
 
     start_time = time.time()
 
-    model = state[0]
-    mask = get_trainable_mask(model)
-    params, _ = eqx.partition(model, mask)
-    grads = jax.tree_util.tree_map(jnp.zeros_like, params)
-    loss = 0
-
     for step in range(step_start, cfg.train.total_steps):
-        for micro_step in range(cfg.train.gradient_accum):
-            batch = next(data_iterator)
+        try:
+            batch = next(dataiter)
+        except StopIteration:
+            break
 
-            latents = batch["latent"]
-            short_captions = batch["short_caption"]
-            long_captions = batch["long_caption"]
+        # the non blocking means that the CPU can keep working while
+        # loading the data onto the GPU, basically just a speed up that
+        # required pin memory also to be True
+        latents = batch[0].to(device=device, non_blocking=True)
+        short = batch[1].to(device=device, non_blocking=True, dtype=torch.long)
+        short_mask = batch[2].to(device=device, non_blocking=True, dtype=torch.long)
+        long = batch[3].to(device=device, non_blocking=True, dtype=torch.long)
+        long_mask = batch[4].to(device=device, non_blocking=True, dtype=torch.long)
 
-            key, sub_key = jr.split(key)
+        B = latents.shape[0]
 
-            indices = jax.random.randint(
-                key,
-                shape=(int(len(short_captions) * cfg.train.short_caption_percent),),
-                minval=0,
-                maxval=len(short_captions),
+        # short cpation ratio
+        num_drop = int(B * cfg.train.cfg_p)
+        if num_drop > 0:
+            indx = torch.randint(
+                0,
+                B,
+                (num_drop,),
+                device=short.device,
+                dtype=torch.long,
             )
+            long[indx] = short[indx]
+            long_mask[indx] = short_mask[indx]
 
-            captions = long_captions
-            captions[indices] = short_captions[indices]
+        X1 = latents.to(dtype=torch.bfloat16) * scaling_factor
+        # Mean shift to 0
+        X1 = X1 - cfg.train.latent_mean
 
-            text_tokens, masks = encode_with_t5gemma_encoder(
-                captions,
-                model=None,
-                params=t5gemma_params,
-                tokenizer=preset.tokenizer,
-                max_input_length=cfg.train.max_input_length,
-                model_sharding=t5_sharding,
-                data_sharding=data_sharding,
-                return_on_host=False,
-                forward_fn=t5_forward_jit,
-            )
+        # Noise tensor
+        X0 = torch.randn(X1.shape, dtype=X1.dtype, device=device)
 
-            latents = jax.device_put(latents, data_sharding)
-            text_tokens = jax.device_put(text_tokens, data_sharding)
-            masks = jax.device_put(masks, data_sharding)
+        eps = torch.randn((B,), device=device, dtype=torch.float32)
+        t = torch.sigmoid(eps).to(dtype=X1.dtype)
+        t_mult = t[:, None, None, None]
 
-            # with jax sharding, this still actually prints the global batch size
-            B = latents.shape[0]
+        Xt = t_mult * X1 + (1 - t_mult) * X0
+        V = X1 - X0
 
-            key, sub_key = jr.split(key)
+        optimizer.zero_grad(set_to_none=True)
 
-            # X1 inherit the sharding from latents
-            X1 = jnp.array(latents, dtype=jnp.int16).view(jnp.bfloat16) * scaling_factor
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):  # pyrefly:ignore
+            input_ids = {
+                "input_ids": long,
+                "attention_mask": long_mask,
+            }
+            text_embed = gemma.encoder(**input_ids).last_hidden_state 
+            pred = model(Xt, t, text_embed)
 
-            if not jnp.all(jnp.isfinite(X1)):
-                print(f"Skipping step {step}: NaN detected in latents")
-                continue
-
-            X1 = X1 - cfg.train.latent_mean
-
-            key, sub_key = jr.split(key)
-            # because jax sharding treats the shape as if it were on one GIGA-GPU
-            # I have to reshard this
-            X0 = jax.random.normal(key, shape=X1.shape, dtype=X1.dtype)
-            X0 = jax.device_put(X0, data_sharding)
-
-            # and the same idea for X0 is needed here
-            key, sub_key = jr.split(key)
-            eps = jax.random.normal(key, shape=[B])
-            eps = jax.device_put(eps, data_sharding)
-
-            # t inherits the sharding from eps
-            t = jax.nn.sigmoid(eps)
-            t_mult = t[:, None, None, None]
-
-            Xt = t_mult * X1 + (1 - t_mult) * X0
-
-            state, loss, grads = step_model(
-                state,
-                optimizer,
-                Xt,
-                X1 - X0,
-                t,
-                text_tokens,
-                masks,
-                model_sharding,
-                data_sharding,
-                jnp.asarray(micro_step),
-                cfg.train.gradient_accum,
-                grads,
-            )
-            model, _opt_state = state
+        loss = F.mse_loss(V, pred)
+        loss.backward()
+        optimizer.step()
 
         if cfg.wandb.enabled and (step + 1) % cfg.train.every_n_steps == 0:
-            wandb.log(
-                {
-                    "train_step": step + 1,
-                    "train/loss": loss,
-                }
-            )
+            loss_detached = loss.detach()
+            dist.all_reduce(loss_detached, op=dist.ReduceOp.AVG)
+            if is_main:
+                wandb.log(
+                    {
+                        "train_step": step + 1,
+                        "train/loss": loss_detached.item(),
+                    }
+                )
         if (step + 1) % cfg.train.every_n_ema == 0:
             decay = ema_scheduler(
                 cfg.train.ema_decay, cfg.train.ema_init, step, cfg.train.ema_warmup
             )
             model_ema = update_ema(model_ema, model, decay=decay)
-        if (step + 1) % cfg.train.every_n_checkpoint == 0:
-            save_args = ocp.args.Composite(
-                state=ocp.args.StandardSave(state),
-                model_ema=ocp.args.StandardSave(model_ema),
-                dataset=grain.PyGrainCheckpointSave(data_iterator),
+        if (step + 1) % cfg.train.every_n_checkpoint == 0 and is_main:
+            save_dir = os.path.abspath(cfg.train.checkpoint_dir)
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, f"model_{step + 1}.pt")
+            torch.save(
+                {
+                    "model": model.module.state_dict(),
+                    "model_ema": model_ema.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "step": step,
+                },
+                save_path,
             )
-            checkpoint_manager.save(step + 1, args=save_args)
-        if cfg.wandb.enabled and (step + 1) % cfg.train.every_n_image == 0:
-            jax.block_until_ready(state)
-            end_time = time.time()
+            # Remove anything more than 5 checkpoints (keep highest step numbers).
+            # Only considers files matching model_<int>.pt in the checkpoint dir.
+            checkpoints = []
+            for fname in os.listdir(save_dir):
+                m = re.fullmatch(r"model_(\d+)\.pt", fname)
+                if m is None:
+                    continue
+                checkpoints.append((int(m.group(1)), os.path.join(save_dir, fname)))
 
-            generated_latents_ema = generate_samples(
-                model_ema,
-                validation_noise,
-                validation_tokens,
-                validation_masks,
-                model_sharding,
-                data_sharding,
-            )
+            if len(checkpoints) > 5:
+                checkpoints.sort(key=lambda x: x[0])  # ascending by step
+                to_delete = checkpoints[: max(0, len(checkpoints) - 5)]
+                for _, path in to_delete:
+                    try:
+                        os.remove(path)
+                    except FileNotFoundError:
+                        pass
 
-            generated_latents_ema = generated_latents_ema + cfg.train.latent_mean
-            generated_latents_ema = generated_latents_ema / vae.config.scaling_factor
-            jax.block_until_ready(generated_latents_ema)
-
-            generated_latents_model = generate_samples(
-                model,
-                validation_noise,
-                validation_tokens,
-                validation_masks,
-                model_sharding,
-                data_sharding,
-            )
-            generated_latents_model = generated_latents_model + cfg.train.latent_mean
-            generated_latents_model = (
-                generated_latents_model / vae.config.scaling_factor
-            )
-
-            generated_latents_ema = jax.device_get(generated_latents_ema)
-            generated_latents_model = jax.device_get(generated_latents_model)
-
-            decode_start_time = time.time()
-            generated_latents_ema = np.array(generated_latents_ema, copy=True)
-            generated_latents_model = np.array(generated_latents_model, copy=True)
+        if cfg.wandb.enabled and (step + 1) % cfg.train.every_n_image == 0 and is_main:
+            print("------------------------------")
+            print(f" VAE device: {next(vae.parameters()).device}")
+            print("------------------------------")
+            assert validation_noise is not None and validation_labels is not None
+            with torch.inference_mode():
+                generated_latents_ema = generate_samples(
+                    model_ema,
+                    validation_noise,
+                    validation_labels,
+                )
+                generated_latents_model = generate_samples(
+                    model,
+                    validation_noise,
+                    validation_labels,
+                )
             generated_latents_ema = (
-                torch.from_numpy(generated_latents_ema)
-                .to("cpu")
-                .to(dtype=torch.bfloat16)
-            )
+                generated_latents_ema + cfg.train.latent_mean
+            ) / vae.config.scaling_factor
             generated_latents_model = (
-                torch.from_numpy(generated_latents_model)
-                .to("cpu")
-                .to(dtype=torch.bfloat16)
+                generated_latents_model + cfg.train.latent_mean
+            ) / vae.config.scaling_factor
+
+            # Ensure VAE decode inputs match the VAE's device/dtype.
+            vae_param = next(vae.parameters())
+            vae_device = vae_param.device
+            vae_dtype = vae_param.dtype
+            generated_latents_ema = generated_latents_ema.to(
+                device=vae_device, dtype=vae_dtype
             )
+            generated_latents_model = generated_latents_model.to(
+                device=vae_device, dtype=vae_dtype
+            )
+            decode_start_time = time.time()
 
             # [B,T,C,H,W]
-            generated_latents_ema = generated_latents_ema.view(-1, 16, 32, 32)
-            generated_latents_model = generated_latents_model.view(-1, 16, 32, 32)
+            generated_latents_ema = generated_latents_ema.reshape(-1, 16, 32, 32)
+            generated_latents_model = generated_latents_model.reshape(-1, 16, 32, 32)
             with torch.inference_mode():
                 decoded_images_ema = vae.decode(generated_latents_ema)[0]
                 decoded_images_model = vae.decode(generated_latents_model)[0]
@@ -496,232 +339,136 @@ def train(
             )
 
             decoded_images_ema = (
-                decoded_images_ema.permute(1, 2, 0).clip(0, 1).float().numpy() * 255.0
+                decoded_images_ema.permute(1, 2, 0).clamp(0, 1).float().cpu().numpy()
+                * 255.0
             )
             decoded_images_model = (
-                decoded_images_model.permute(1, 2, 0).clip(0, 1).float().numpy() * 255.0
+                decoded_images_model.permute(1, 2, 0).clamp(0, 1).float().cpu().numpy()
+                * 255.0
             )
             decoded_images = np.concatenate(
                 [decoded_images_ema, decoded_images_model], axis=1
             ).astype(np.uint8)
 
-            print(
-                f"Time to decode latents fully on cpu: {(time.time() - decode_start_time):.4f} s."
-            )
+            print(f"Time to decode latents: {(time.time() - decode_start_time):.4f} s.")
+            end_time = time.time()
             if start_time is not None:
                 wandb.log(
                     {f"train/{cfg.train.every_n_image} time": end_time - start_time}
                 )
 
-            caption_text = "EMA | Regular\n" + "\n".join(
-                [f"Row {i}: {c}" for i, c in enumerate(validation_captions)]
+            caption = (
+                "Left: EMA | Right: Regular. Rows (top→bottom): "
+                "2 great white shark; 316 praying mantis; 418 hot air balloon; "
+                "551 espresso maker; 804 snowplow; 981 volcano; 984 scuba diver; "
+                "1000 null"
             )
-            wandb.log(
-                {"image/examples": wandb.Image(decoded_images, caption=caption_text)}
-            )
+            wandb.log({"image/examples": wandb.Image(decoded_images, caption=caption)})
             start_time = time.time()
 
         if step >= cfg.train.total_steps:
             break
 
-    return state
-
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig):
-    from jax._src.interpreters.partial_eval import Val
-    import os
-    import jax
-    import jax.numpy as jnp
-    from pathlib import Path
-    from typing import Any, Sequence, Union
-    from jaxtyping import Array, Bool, Float, Int
-    import jax.sharding as jshard
+    # setup DDP
+    local_rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    # world_size and rank are redundant on one node but good practice
+    is_main: bool = True if rank == 0 else False
 
-    # This was some HPC issue that I had no idea what it was
-    # Thanks Gemini 3.0 Pro for fixing it lol
-    conda_prefix = os.environ.get("CONDA_PREFIX")
-    if conda_prefix:
-        ca_bundle = Path(conda_prefix) / "ssl" / "cacert.pem"
-        if ca_bundle.exists():
-            os.environ.setdefault("SSL_CERT_FILE", str(ca_bundle))
-            os.environ.setdefault("CURL_CA_BUNDLE", str(ca_bundle))
-            os.environ.setdefault("REQUESTS_CA_BUNDLE", str(ca_bundle))
-            print("Using CA bundle:", ca_bundle)
-        else:
-            print("Conda CA bundle not found at:", ca_bundle)
-    else:
-        print("CONDA_PREFIX not set; leaving SSL cert settings unchanged.")
+    torch.cuda.set_device(local_rank)
 
-    CKPT_DIR = Path("/home/chojnowski.h/weishao/chojnowski.h/JaxFM/t5gemma")
-    assert CKPT_DIR.exists(), f"Checkpoint folder not found: {CKPT_DIR}"
-    print("Using checkpoint:", CKPT_DIR)
+    dist.init_process_group(
+        backend="nccl", init_method="env://"
+    )  # nvidia collective communications library
 
-    from gemma import gm
-    from gemma.research import t5gemma
+    device = torch.device("cuda", local_rank)
 
-    preset = t5gemma.T5GemmaPreset.GEMMA2_XL_XL
-    t5gemma_model = preset.config.make("transformer")
-
-    t5gemma_params = gm.ckpts.load_params(CKPT_DIR)
-
-    if "decoder" in t5gemma_params:
-        del t5gemma_params["decoder"]  # pyrefly:ignore
-
-    # Cast T5 params to bfloat16 for faster inference
-    t5gemma_params = jax.tree_util.tree_map(
-        lambda x: x.astype(jnp.bfloat16) if eqx.is_inexact_array(x) else x,
-        t5gemma_params,
+    data_dir = cfg.data.data_dir
+    shard_names = sorted(os.listdir(data_dir))  # For determinism accross nodes
+    shard_paths = [os.path.join(data_dir, shard_name) for shard_name in shard_names]
+    dataset = LatentShardDatasetStage1(shard_paths=shard_paths, seed=cfg.data.seed)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=cfg.data.batch_size,
+        num_workers=cfg.data.num_workers,
+        pin_memory=True,
+        persistent_workers=(cfg.data.num_workers > 0),  # Since infinite dataloader
+        drop_last=True,
     )
+    dataiter = iter(dataloader)
 
-    devices = jax.devices()
-    mesh = jshard.Mesh(devices, axis_names=("data",))
+    model = hydra.utils.instantiate(cfg.model)
 
-    key = jr.PRNGKey(cfg.train.seed)
+    params = param_groups_weight_decay(model, cfg.train.weight_decay)
+    optimizer = torch.optim.AdamW(params, lr=cfg.train.lr, eps=1e-15)
 
-    ckpt_dir = os.path.abspath(cfg.train.checkpoint_dir)
-    options = ocp.CheckpointManagerOptions(max_to_keep=5, create=True)
-    checkpoint_manager = ocp.CheckpointManager(
-        ckpt_dir, options=options, item_names=("state", "model_ema", "dataset")
+    tokenizer = AutoTokenizer.from_pretrained("google/t5gemma-xl-xl-ul2")
+    gemma = AutoModelForSeq2SeqLM.from_pretrained(
+        "google/t5gemma-xl-xl-ul2",
+        device_map={"": device},
     )
+    gemma = gemma.model
 
-    model_sharding = jshard.NamedSharding(mesh, jshard.PartitionSpec())
-    data_sharding = jshard.NamedSharding(mesh, jshard.PartitionSpec("data"))
-    cpu_sharding = jax.sharding.SingleDeviceSharding(jax.devices("cpu")[0])
-
-    dataloader = hydra.utils.instantiate(cfg.data)
-    data_iterator = iter(dataloader)
-
-    model = hydra.utils.instantiate(cfg.model, key=key)
-    trainable_mask = get_trainable_mask(model)
-    params, _ = eqx.partition(model, trainable_mask)
-
-    schedule = hydra.utils.instantiate(cfg.optim)
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(cfg.train.max_grad),
-        optax.adamw(
-            learning_rate=schedule,
-            eps=1e-15,
-            weight_decay=cfg.train.weight_decay,
-        ),
-    )
-    opt_state = optimizer.init(params)
-
-    # restoration logic
     step_start = 0
-    if not cfg.train.is_restore:
-        ckpt_dir_new = os.path.abspath(cfg.train.checkpoint_init_dir)
-        options = ocp.CheckpointManagerOptions(max_to_keep=1, create=True)
-        initial_mngr = ocp.CheckpointManager(
-            ckpt_dir_new, options=options, item_names=("model",)
+
+    if os.path.exists(cfg.train.resume_path) and cfg.train.is_restore:
+        model_ema = copy.deepcopy(model)
+
+        resume_dict = torch.load(
+            os.path.abspath(cfg.train.resume_path), map_location="cpu"
         )
 
-        abstract_model = jax.tree_util.tree_map(
-            lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=cpu_sharding),
-            model,
-        )
-
-        del model
-
-        print("Loading reparameterized model...")
-        restore_args = ocp.args.Composite(
-            model=ocp.args.StandardRestore(abstract_model),
-        )
-        restored = initial_mngr.restore(0, args=restore_args)
-
-        model = restored["model"]
-
-        model = jax.tree_util.tree_map(
-            lambda x: jax.device_put(x, model_sharding) if eqx.is_array(x) else x,
-            model,
-        )
-
-        # Ensures optimizer state matches the restored parameters.
-        trainable_mask = get_trainable_mask(model)
-        params, _ = eqx.partition(model, trainable_mask)
-        opt_state = optimizer.init(params)
-
-        state = (model, opt_state)
-        model_ema = jax.tree_util.tree_map(
-            lambda x: jnp.copy(x) if eqx.is_inexact_array(x) else x, model
-        )
-
-        state = jax.tree_util.tree_map(
-            lambda x: jax.device_put(x, model_sharding) if eqx.is_array(x) else x,
-            state,
-        )
-        model_ema = jax.tree_util.tree_map(
-            lambda x: jax.device_put(x, model_sharding) if eqx.is_array(x) else x,
-            model_ema,
-        )
-
-        step_start = 0
-
-        del restored
-    elif checkpoint_manager.latest_step() is not None and cfg.train.is_restore:
-        state = (model, opt_state)
-
-        abstract_state = jax.tree_util.tree_map(
-            lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=cpu_sharding),
-            state,
-        )
-
-        abstract_model = jax.tree_util.tree_map(
-            lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=cpu_sharding),
-            model,
-        )
-
-        del state
-        del model
-        del opt_state
-
-        print(
-            f"Restoring previous trianing at step {checkpoint_manager.latest_step()}/{cfg.train.total_steps}"
-        )
-        restore_args = ocp.args.Composite(
-            model_ema=ocp.args.StandardRestore(abstract_model),
-            dataset=grain.PyGrainCheckpointRestore(data_iterator),
-        )
-        restored = checkpoint_manager.restore(
-            checkpoint_manager.latest_step(), args=restore_args
-        )
-
-        state = restored["state"]
-        model_ema = restored["model_ema"]
-
-        state = jax.tree_util.tree_map(
-            lambda x: jax.device_put(x, model_sharding) if eqx.is_array(x) else x,
-            state,
-        )
-        model_ema = jax.tree_util.tree_map(
-            lambda x: jax.device_put(x, model_sharding) if eqx.is_array(x) else x,
-            model_ema,
-        )
-
-        step_start = checkpoint_manager.latest_step()
-
-        del restored
+        model.load_state_dict(resume_dict["model"])
+        model_ema.load_state_dict(resume_dict["model_ema"])
+        optimizer.load_state_dict(resume_dict["optimizer"])
+        step_start = resume_dict["step"]
     else:
-        return ValueError("Some initial point should be given.")
+        model_ema = copy.deepcopy(model)
 
-    vae = hydra.utils.instantiate(cfg.vae).to("cpu")
+    vae = hydra.utils.instantiate(cfg.vae)
+    # Keep VAE on CPU (used only for logging/decoding).
+    vae = vae.to(device="cpu")
+    if is_main:
+        print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
+        vae = vae.to(device=device)
+        print(f"VAE number of parameters: {sum(p.numel() for p in vae.parameters())}")
+        print(f"Gemma number of parameters: {sum(p.numel() for p in gemma.parameters())}")
+
+    # move to devices
+    model = model.to(device=device)
+    # model = torch.compile(model)
+    model_ema = model_ema.to(device=device)
+    model = DDP(model, device_ids=[local_rank])
+
+    for param in model_ema.parameters():
+        param.requires_grad = False
+    for param in vae.parameters():
+        param.requires_grad = False
+    for param in gemma.parameters():
+        param.required_grad = False
+    model_ema.eval()
+    gemma.eval()
+    vae.eval()
 
     train(
-        state,
+        model,
         model_ema,
+        gemma,
+        tokenizer,
         optimizer,
-        data_iterator,
+        dataiter,
         vae,
         cfg,
-        model_sharding,
-        data_sharding,
-        key,
-        checkpoint_manager,
-        t5gemma_model,
-        t5gemma_params,
-        preset,
+        is_main,
+        device,
         step_start,
     )
+
+    dist.destroy_process_group()  # DDP cleanup
 
 
 if __name__ == "__main__":
