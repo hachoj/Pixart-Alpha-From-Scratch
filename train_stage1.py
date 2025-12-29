@@ -165,12 +165,12 @@ def train(
 
         # ImageNet-1K labels:
         # 2   = great white shark
-        # 316 = praying mantis
-        # 418 = hot air balloon
-        # 551 = espresso maker
-        # 804 = snowplow
-        # 981 = volcano
-        # 984 = scuba diver
+        # 316 = cicada
+        # 418 = pen
+        # 551 = face powder
+        # 804 = soap dispenser
+        # 981 = baseball player
+        # 984 = rapeseed
         validation_labels = torch.tensor(
             [2, 316, 418, 551, 804, 981, 984, 1000], device=device
         )
@@ -345,8 +345,8 @@ def train(
 
             caption = (
                 "Left: EMA | Right: Regular. Rows (top→bottom): "
-                "2 great white shark; 316 praying mantis; 418 hot air balloon; "
-                "551 espresso maker; 804 snowplow; 981 volcano; 984 scuba diver; "
+                "2 great white shark; 316 cicada; 418 pen; "
+                "551 face powder; 804 soap dispenser; 981 baseball player; 984 rapeseed; "
                 "1000 null"
             )
             wandb.log({"image/examples": wandb.Image(decoded_images, caption=caption)})
