@@ -79,7 +79,6 @@ def update_ema(model_ema, model, decay):
 
     for k, v in sd.items():
         target_key = k
-        print("Updating EMA for key:", target_key)
         if target_key in ema_sd and v.dtype.is_floating_point:
             ema_sd[target_key].mul_(decay).add_(v * (1 - decay))
 
