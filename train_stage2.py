@@ -64,20 +64,24 @@ def ema_scheduler(decay, init_decay, step, warmup_steps):
         return ((decay - init_decay) / warmup_steps) * step + init_decay
 
 
+def strip_orig_mod(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def clean_key(key: str) -> str:
+        cleaned = key.replace("_orig_mod", "")
+        return cleaned.lstrip(".")
+
+    return {clean_key(k): v for k, v in state_dict.items()}
+
+
 @torch.no_grad()
 def update_ema(model_ema, model, decay):
-    # #####################
-    # CHAT GPT ADDED
-    # #################
-    if isinstance(model, DDP):
-        sd = model.module.state_dict()
-    else:
-        sd = model.state_dict()
+    sd = strip_orig_mod(model.module.state_dict())
     ema_sd = model_ema.state_dict()
 
     for k, v in sd.items():
-        if v.dtype.is_floating_point:
-            ema_sd[k].mul_(decay).add_(v * (1 - decay))
+        target_key = k
+        print("Updating EMA for key:", target_key)
+        if target_key in ema_sd and v.dtype.is_floating_point:
+            ema_sd[target_key].mul_(decay).add_(v * (1 - decay))
 
     return model_ema
 
@@ -148,10 +152,6 @@ def generate_samples(model, noise, text_tokens, text_mask, num_steps=24, num_sav
 def train(
     model,
     model_ema,
-    # #####################
-    # CHAT GPT ADDED
-    # #################
-    model_for_ema,
     gemma,
     tokenizer,
     optimizer,
@@ -306,10 +306,7 @@ def train(
             decay = ema_scheduler(
                 cfg.train.ema_decay, cfg.train.ema_init, step, cfg.train.ema_warmup
             )
-            # #####################
-            # CHAT GPT ADDED
-            # #################
-            model_ema = update_ema(model_ema, model_for_ema, decay=decay)
+            model_ema = update_ema(model_ema, model, decay=decay)
         if (step + 1) % cfg.train.every_n_checkpoint == 0 and is_main:
             save_dir = os.path.abspath(cfg.train.checkpoint_dir)
             os.makedirs(save_dir, exist_ok=True)
@@ -491,11 +488,6 @@ def main(cfg: DictConfig):
     else:
         raise ValueError("No init model given.")
 
-    # #####################
-    # CHAT GPT ADDED
-    # #################
-    model_for_ema = model
-
     vae = hydra.utils.instantiate(cfg.vae)
     vae = vae.to(device="cpu")
     if is_main:
@@ -523,10 +515,6 @@ def main(cfg: DictConfig):
     train(
         model,
         model_ema,
-        # #####################
-        # CHAT GPT ADDED
-        # #################
-        model_for_ema,
         gemma,
         tokenizer,
         optimizer,
