@@ -42,6 +42,7 @@ class DiTBlock(nn.Module):
         attn_mask: Bool[Tensor, "b seq_len num_tokens"] = repeat(
             text_mask, "b t -> b s t", s=s
         )
+        attn_mask = attn_mask.unsqueeze(1)
 
         x: Float[Tensor, "b seq_len embed_dim"] = x + self.cross_attention(
             query=x, key=text_tokens, value=text_tokens, mask=attn_mask

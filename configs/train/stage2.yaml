@@ -1,6 +1,6 @@
 total_steps: 150000 # given effetive batch size from grad accumm, true steps would be grad_accum times this number
-batch_size: 512
-gradient_accum: 11
+batch_size: 256
+grad_accum: 3
 every_n_steps: 10
 every_n_image: 1000
 every_n_checkpoint: 1000
@@ -9,8 +9,8 @@ ema_decay: 0.99
 ema_init: 0.01
 ema_warmup: 0
 
-checkpoint_dir: "checkpoints"
-checkpoint_init_dir: "0new_model"
+checkpoint_dir: "checkpoints/"
+checkpoint_init_dir: "checkpoints_stage1/new_reparameterized_model.pt"
 seed: 42
 lr: 1e-4
 max_grad: 1.0
@@ -19,7 +19,7 @@ warmup_steps: 2000
 weight_decay: 0.03
 latent_mean: 0.177456
 
-max_input_length: 120
+max_input_length: 100
 short_caption_percent: 0.05
 
 is_restore: False

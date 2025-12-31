@@ -24,7 +24,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 # Dataloader
-from data.data import LatentShardDatasetStage1
+from data.data import LatentShardDatasetStage2
 
 # Gemma
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
@@ -66,7 +66,13 @@ def ema_scheduler(decay, init_decay, step, warmup_steps):
 
 @torch.no_grad()
 def update_ema(model_ema, model, decay):
-    sd = model.module.state_dict()
+    # #####################
+    # CHAT GPT ADDED
+    # #################
+    if isinstance(model, DDP):
+        sd = model.module.state_dict()
+    else:
+        sd = model.state_dict()
     ema_sd = model_ema.state_dict()
 
     for k, v in sd.items():
@@ -76,16 +82,21 @@ def update_ema(model_ema, model, decay):
     return model_ema
 
 
-def single_sample_fn(model, noise, label, num_steps=24, num_save_steps=6):
+def single_sample_fn(
+    model, noise, text_tokens, text_mask, num_steps=24, num_save_steps=6
+):
     if noise.dim() == 3:
         noise = noise.unsqueeze(0)
-    if label.dim() == 0:
-        label = label.unsqueeze(0)
+    if text_tokens.dim() == 2:
+        text_tokens = text_tokens.unsqueeze(0)
+    if text_mask.dim() == 1:
+        text_mask = text_mask.unsqueeze(0)
 
     samples = generate_samples(
         model,
         noise,
-        label,
+        text_tokens,
+        text_mask,
         num_steps=num_steps,
         num_save_steps=num_save_steps,
     )
@@ -93,8 +104,11 @@ def single_sample_fn(model, noise, label, num_steps=24, num_save_steps=6):
 
 
 @torch.inference_mode()
-def generate_samples(model, noise, labels, num_steps=24, num_save_steps=6):
-    labels = labels.to(device=noise.device)
+def generate_samples(model, noise, text_tokens, text_mask, num_steps=24, num_save_steps=6):
+    text_tokens = text_tokens.to(device=noise.device)
+    text_mask = text_mask.to(device=noise.device)
+    if text_mask.dtype is not torch.bool:
+        text_mask = text_mask.bool()
     save_times = torch.linspace(0.0, 1.0, num_save_steps, device=noise.device)
 
     def vector_field(t, y):
@@ -108,7 +122,7 @@ def generate_samples(model, noise, labels, num_steps=24, num_save_steps=6):
             dtype=torch.bfloat16,
             enabled=(y.device.type == "cuda"),
         ):
-            out = model(y, t_batch, labels)
+            out = model(y, t_batch, text_tokens, text_mask)
         return out.to(y.dtype)
 
     sol = torchdiffeq.odeint(
@@ -134,6 +148,10 @@ def generate_samples(model, noise, labels, num_steps=24, num_save_steps=6):
 def train(
     model,
     model_ema,
+    # #####################
+    # CHAT GPT ADDED
+    # #################
+    model_for_ema,
     gemma,
     tokenizer,
     optimizer,
@@ -158,90 +176,124 @@ def train(
         wandb.define_metric("train/*", step_metric="train_step")
         wandb.define_metric("image/*", step_metric="train_step")
 
+    model_ema.eval()
+    gemma.eval()
+    vae.eval()
+
     scaling_factor = vae.config.scaling_factor
 
     validation_noise = None
-    validation_text = ["", ""]# TODO
+    validation_text_tokens = None
+    validation_text_mask = None
+    validation_text = []
     if is_main:
+        validation_text = [
+            "A fractured concrete stairwell spirals downward inside a cylindrical shaft, its chipped edges exposing layered aggregate and rust-stained rebar. Cool directional light from a circular skylight creates sharp radial shadows, emphasizing rough textures and high-frequency surface noise. The palette is desaturated gray and ochre, with dark voids between steps fading into low-contrast black.",
+            "A transparent glass cube rests on a matte black plane, containing suspended metallic spheres of varying diameters arranged in a precise lattice. Hard studio lighting produces crisp caustics, mirrored reflections, and specular highlights that refract through the cube’s beveled edges. The color scheme is minimal, dominated by clear glass, chrome silver, and deep neutral blacks.",
+            "A high-speed macro view of a water droplet impacts a shallow liquid surface, forming a crown-shaped splash with thin upward jets and micro-beaded rims. Backlighting creates bright rim highlights and translucent gradients within the fluid structures, freezing fine surface tension details. The background is uniformly dark, contrasting with the pale blue-gray liquid and sharp white highlights.",
+            "A dense urban intersection is captured from above, with parallel lanes of vehicles rendered as elongated streaks due to long-exposure motion blur. Sodium-vapor streetlights cast warm orange bands across asphalt textured with painted markings and oil-slick reflections. Cool blue shadows from surrounding buildings intersect the warm tones, creating high-contrast color separation across the frame.",
+        ]
         validation_noise = torch.randn(
             (1, 16, 32, 32), dtype=torch.float32, device=device
         )
-        validation_noise = repeat(validation_noise, "1 ... -> b ...", b=8)
-
-        # ImageNet-1K labels:
-        # 2   = great white shark
-        # 316 = praying mantis
-        # 418 = hot air balloon
-        # 551 = espresso maker
-        # 804 = snowplow
-        # 981 = volcano
-        # 984 = scuba diver
-        validation_labels = torch.tensor(
-            [2, 316, 418, 551, 804, 981, 984, 1000], device=device
+        validation_noise = repeat(
+            validation_noise, "1 ... -> b ...", b=len(validation_text)
         )
+
+        validation_inputs = tokenizer(
+            validation_text,
+            padding="max_length",
+            truncation=True,
+            max_length=cfg.train.max_input_length,
+            return_tensors="pt",
+        )
+        validation_inputs = {
+            "input_ids": validation_inputs["input_ids"].to(device=device),
+            "attention_mask": validation_inputs["attention_mask"].to(device=device),
+        }
+        with torch.inference_mode():
+            with autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=(device.type == "cuda"),
+            ):
+                validation_text_tokens = gemma.encoder(
+                    **validation_inputs
+                ).last_hidden_state
+        validation_text_mask = validation_inputs["attention_mask"].bool()
 
     start_time = time.time()
 
     for step in range(step_start, cfg.train.total_steps):
-        try:
-            batch = next(dataiter)
-        except StopIteration:
-            break
-
-        # the non blocking means that the CPU can keep working while
-        # loading the data onto the GPU, basically just a speed up that
-        # required pin memory also to be True
-        latents = batch[0].to(device=device, non_blocking=True)
-        short = batch[1].to(device=device, non_blocking=True, dtype=torch.long)
-        short_mask = batch[2].to(device=device, non_blocking=True, dtype=torch.long)
-        long = batch[3].to(device=device, non_blocking=True, dtype=torch.long)
-        long_mask = batch[4].to(device=device, non_blocking=True, dtype=torch.long)
-
-        B = latents.shape[0]
-
-        # short cpation ratio
-        num_drop = int(B * cfg.train.cfg_p)
-        if num_drop > 0:
-            indx = torch.randint(
-                0,
-                B,
-                (num_drop,),
-                device=short.device,
-                dtype=torch.long,
-            )
-            long[indx] = short[indx]
-            long_mask[indx] = short_mask[indx]
-
-        X1 = latents.to(dtype=torch.bfloat16) * scaling_factor
-        # Mean shift to 0
-        X1 = X1 - cfg.train.latent_mean
-
-        # Noise tensor
-        X0 = torch.randn(X1.shape, dtype=X1.dtype, device=device)
-
-        eps = torch.randn((B,), device=device, dtype=torch.float32)
-        t = torch.sigmoid(eps).to(dtype=X1.dtype)
-        t_mult = t[:, None, None, None]
-
-        Xt = t_mult * X1 + (1 - t_mult) * X0
-        V = X1 - X0
-
+        model.train()
         optimizer.zero_grad(set_to_none=True)
+        loss_sum = torch.zeros((), device=device)
+        for micro_step in range(cfg.train.grad_accum):
+            try:
+                batch = next(dataiter)
+            except StopIteration:
+                break
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):  # pyrefly:ignore
-            input_ids = {
-                "input_ids": long,
-                "attention_mask": long_mask,
-            }
-            text_embed = gemma.encoder(**input_ids).last_hidden_state 
-            pred = model(Xt, t, text_embed)
+            # the non blocking means that the CPU can keep working while
+            # loading the data onto the GPU, basically just a speed up that
+            # required pin memory also to be True
+            latents = batch[0].to(device=device, non_blocking=True)
+            short = batch[1].to(device=device, non_blocking=True, dtype=torch.long)
+            short_mask = batch[2].to(device=device, non_blocking=True, dtype=torch.long)
+            long = batch[3].to(device=device, non_blocking=True, dtype=torch.long)
+            long_mask = batch[4].to(device=device, non_blocking=True, dtype=torch.long)
 
-        loss = F.mse_loss(V, pred)
-        loss.backward()
+            B = latents.shape[0]
+
+            # short cpation ratio
+            num_drop = int(B * cfg.train.cfg_p)
+            if num_drop > 0:
+                indx = torch.randint(
+                    0,
+                    B,
+                    (num_drop,),
+                    device=short.device,
+                    dtype=torch.long,
+                )
+                long[indx] = short[indx]
+                long_mask[indx] = short_mask[indx]
+
+            X1 = latents.to(dtype=torch.bfloat16) * scaling_factor
+            # Mean shift to 0
+            X1 = X1 - cfg.train.latent_mean
+
+            # Noise tensor
+            X0 = torch.randn(X1.shape, dtype=X1.dtype, device=device)
+
+            eps = torch.randn((B,), device=device, dtype=torch.float32)
+            t = torch.sigmoid(eps).to(dtype=X1.dtype)
+            t_mult = t[:, None, None, None]
+
+            Xt = t_mult * X1 + (1 - t_mult) * X0
+            V = X1 - X0
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):  # pyrefly:ignore
+                input_ids = {
+                    "input_ids": long,
+                    "attention_mask": long_mask,
+                }
+                with torch.no_grad():
+                    text_embed = gemma.encoder(**input_ids).last_hidden_state
+                text_mask = long_mask.bool()
+                pred = model(Xt, t, text_embed, text_mask)
+
+            loss = F.mse_loss(V, pred) / cfg.train.grad_accum
+            loss_sum += loss.detach()
+            if micro_step >= cfg.train.grad_accum - 1:
+                loss.backward()
+            else:
+                with model.no_sync():
+                    loss.backward()
         optimizer.step()
 
+
         if cfg.wandb.enabled and (step + 1) % cfg.train.every_n_steps == 0:
-            loss_detached = loss.detach()
+            loss_detached = loss_sum
             dist.all_reduce(loss_detached, op=dist.ReduceOp.AVG)
             if is_main:
                 wandb.log(
@@ -254,7 +306,10 @@ def train(
             decay = ema_scheduler(
                 cfg.train.ema_decay, cfg.train.ema_init, step, cfg.train.ema_warmup
             )
-            model_ema = update_ema(model_ema, model, decay=decay)
+            # #####################
+            # CHAT GPT ADDED
+            # #################
+            model_ema = update_ema(model_ema, model_for_ema, decay=decay)
         if (step + 1) % cfg.train.every_n_checkpoint == 0 and is_main:
             save_dir = os.path.abspath(cfg.train.checkpoint_dir)
             os.makedirs(save_dir, exist_ok=True)
@@ -290,17 +345,28 @@ def train(
             print("------------------------------")
             print(f" VAE device: {next(vae.parameters()).device}")
             print("------------------------------")
-            assert validation_noise is not None and validation_labels is not None
+
+            model.eval()
+            model_ema.eval()
+            gemma.eval()
+            vae.eval()
+            assert (
+                validation_noise is not None
+                and validation_text_tokens is not None
+                and validation_text_mask is not None
+            )
             with torch.inference_mode():
                 generated_latents_ema = generate_samples(
                     model_ema,
                     validation_noise,
-                    validation_labels,
+                    validation_text_tokens,
+                    validation_text_mask,
                 )
                 generated_latents_model = generate_samples(
                     model,
                     validation_noise,
-                    validation_labels,
+                    validation_text_tokens,
+                    validation_text_mask,
                 )
             generated_latents_ema = (
                 generated_latents_ema + cfg.train.latent_mean
@@ -357,14 +423,13 @@ def train(
                     {f"train/{cfg.train.every_n_image} time": end_time - start_time}
                 )
 
-            caption = (
-                "Left: EMA | Right: Regular. Rows (top→bottom): "
-                "2 great white shark; 316 praying mantis; 418 hot air balloon; "
-                "551 espresso maker; 804 snowplow; 981 volcano; 984 scuba diver; "
-                "1000 null"
+            caption = "Left: EMA | Right: Regular.\n" + "\n".join(
+                [f"Row {i}: {text}" for i, text in enumerate(validation_text)]
             )
             wandb.log({"image/examples": wandb.Image(decoded_images, caption=caption)})
             start_time = time.time()
+
+            model.train()
 
         if step >= cfg.train.total_steps:
             break
@@ -390,7 +455,7 @@ def main(cfg: DictConfig):
     data_dir = cfg.data.data_dir
     shard_names = sorted(os.listdir(data_dir))  # For determinism accross nodes
     shard_paths = [os.path.join(data_dir, shard_name) for shard_name in shard_names]
-    dataset = LatentShardDatasetStage1(shard_paths=shard_paths, seed=cfg.data.seed)
+    dataset = LatentShardDatasetStage2(shard_paths=shard_paths, seed=cfg.data.seed)
     dataloader = DataLoader(
         dataset,
         batch_size=cfg.data.batch_size,
@@ -412,25 +477,26 @@ def main(cfg: DictConfig):
         device_map={"": device},
     )
     gemma = gemma.model
+    gemma = gemma.to(dtype=torch.bfloat16)
 
     step_start = 0
 
-    if os.path.exists(cfg.train.resume_path) and cfg.train.is_restore:
-        model_ema = copy.deepcopy(model)
-
+    if os.path.exists(cfg.train.checkpoint_init_dir):
         resume_dict = torch.load(
-            os.path.abspath(cfg.train.resume_path), map_location="cpu"
+            os.path.abspath(cfg.train.checkpoint_init_dir), map_location="cpu"
         )
+        model.load_state_dict(resume_dict)
 
-        model.load_state_dict(resume_dict["model"])
-        model_ema.load_state_dict(resume_dict["model_ema"])
-        optimizer.load_state_dict(resume_dict["optimizer"])
-        step_start = resume_dict["step"]
-    else:
         model_ema = copy.deepcopy(model)
+    else:
+        raise ValueError("No init model given.")
+
+    # #####################
+    # CHAT GPT ADDED
+    # #################
+    model_for_ema = model
 
     vae = hydra.utils.instantiate(cfg.vae)
-    # Keep VAE on CPU (used only for logging/decoding).
     vae = vae.to(device="cpu")
     if is_main:
         print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
@@ -440,7 +506,7 @@ def main(cfg: DictConfig):
 
     # move to devices
     model = model.to(device=device)
-    # model = torch.compile(model)
+    model = torch.compile(model)
     model_ema = model_ema.to(device=device)
     model = DDP(model, device_ids=[local_rank])
 
@@ -449,7 +515,7 @@ def main(cfg: DictConfig):
     for param in vae.parameters():
         param.requires_grad = False
     for param in gemma.parameters():
-        param.required_grad = False
+        param.requires_grad = False
     model_ema.eval()
     gemma.eval()
     vae.eval()
@@ -457,6 +523,10 @@ def main(cfg: DictConfig):
     train(
         model,
         model_ema,
+        # #####################
+        # CHAT GPT ADDED
+        # #################
+        model_for_ema,
         gemma,
         tokenizer,
         optimizer,

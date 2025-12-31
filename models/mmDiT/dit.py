@@ -95,11 +95,11 @@ class DiT(nn.Module):
         in_dim,
         dim,
         cond_dim,
+        text_dim,
         num_heads,
         mlp_ratio,
         num_blocks,
         patch_size,
-        num_classes,
         base_image_size,
     ):
         super().__init__()
@@ -111,11 +111,10 @@ class DiT(nn.Module):
             stride=patch_size,
         )
 
-        self.cond_proj = nn.Embedding(num_classes, cond_dim)
         self.time_proj = SinusoidalTimeEmbedding(cond_dim)
 
         self.dit_blocks = nn.ModuleList(
-            [DiTBlock(dim, cond_dim, num_heads, mlp_ratio) for i in range(num_blocks)]
+            [DiTBlock(dim, text_dim, num_heads, mlp_ratio) for i in range(num_blocks)]
         )
 
         self.layer_norm = nn.LayerNorm(dim, elementwise_affine=False, bias=False)
@@ -160,7 +159,7 @@ class DiT(nn.Module):
 
         for block in self.dit_blocks:
             x: Float[Tensor, "b num_patches embed_dim"] = block(
-                x, time_embed, sbar, text_mask
+                x, text_tokens, sbar, text_mask
             )
 
         x: Float[Tensor, "b num_patches embed_dim"] = self.layer_norm(x)

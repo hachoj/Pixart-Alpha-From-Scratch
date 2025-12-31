@@ -9,7 +9,7 @@ ema_init: 0.01
 ema_warmup: 3000
 
 checkpoint_dir: "checkpoints/"
-resume_path: "checkpoints/model.pt"
+resume_path: "checkpoints/model_300000.pt"
 seed: 42
 lr: 1e-4
 max_grad: 1.0

@@ -1,16 +1,16 @@
 #!/bin/bash
 
 #SBATCH --job-name=b200_multi_node
-#SBATCH --ntasks=2
+#SBATCH --ntasks=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=128gb
+#SBATCH --mem=96gb
 #SBATCH --account=weishao
 #SBATCH --qos=weishao
 #SBATCH --partition=hpg-b200
 
-#SBATCH --time=48:00:00
+#SBATCH --time=336:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 mkdir -p logs
@@ -47,4 +47,4 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
     --rdzv_id=$RDZV_ID \
-    train_stage1.py
+    train_stage2.py

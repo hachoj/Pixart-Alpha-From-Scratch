@@ -1,10 +1,5 @@
----
 _target_: data.data.create_dataloader_stage_2
-file_paths:
-  - data/common_canvas_0.array_record
-  - data/common_canvas_1.array_record
-  - data/common_canvas_2.array_record
-  - data/common_canvas_3.array_record
-num_workers: 32
+data_dir: data/stage2/
+num_workers: 2
 batch_size: ${train.batch_size}
 seed: ${train.seed}
