@@ -29,6 +29,7 @@ tensorboard_logs/
 # Weights & Biases
 wandb/
 .wandb/
+.gradio/
 
 # Training artifacts / checkpoints (keep model source code tracked)
 checkpoints/
