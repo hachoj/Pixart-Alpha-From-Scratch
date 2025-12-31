@@ -35,6 +35,7 @@ gradio/
 
 # Training artifacts / checkpoints (keep model source code tracked)
 checkpoints/
+checkpoints_stage1/
 checkpoints_temp/
 saved_models/
 outputs/fw*/
