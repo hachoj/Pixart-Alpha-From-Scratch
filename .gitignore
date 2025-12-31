@@ -31,6 +31,7 @@ wandb/
 .wandb/
 gradio/
 .gradio/
+.gradio
 
 # Training artifacts / checkpoints (keep model source code tracked)
 checkpoints/
