@@ -179,6 +179,8 @@ def train(
     gemma.eval()
     vae.eval()
 
+    grad_clip = float("inf")
+
     scaling_factor = vae.config.scaling_factor
 
     validation_noise = None
@@ -288,17 +290,22 @@ def train(
             else:
                 with model.no_sync():
                     loss.backward()
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
 
         if cfg.wandb.enabled and (step + 1) % cfg.train.every_n_steps == 0:
             loss_detached = loss_sum
             dist.all_reduce(loss_detached, op=dist.ReduceOp.AVG)
+            grad_norm_detached = grad_norm.detach()
+            dist.all_reduce(grad_norm_detached, op=dist.ReduceOp.AVG)
             if is_main:
                 wandb.log(
                     {
                         "train_step": step + 1,
                         "train/loss": loss_detached.item(),
+                        "train/grad_norm": grad_norm_detached.item(),
                     }
                 )
         if (step + 1) % cfg.train.every_n_ema == 0:

@@ -1,7 +1,7 @@
 #!/bin/bash
 
-#SBATCH --job-name=b200_multi_node
-#SBATCH --ntasks=4
+#SBATCH --job-name=b200_multi_node_2x4
+#SBATCH --ntasks=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=16
@@ -10,7 +10,7 @@
 #SBATCH --qos=weishao
 #SBATCH --partition=hpg-b200
 
-#SBATCH --time=336:00:00
+#SBATCH --time=144:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 mkdir -p logs
