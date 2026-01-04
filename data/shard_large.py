@@ -4,7 +4,6 @@ big_start = time.time()
 
 BATCH_SIZE = 256
 
-
 from datasets import IterableDataset, load_dataset
 from torch.utils.data import DataLoader
 import torchvision.transforms.v2 as v2
@@ -16,7 +15,6 @@ from prompt import prompt  # pyrefly:ignore
 
 from diffusers.models import AutoencoderKL
 from transformers import (
-    # Qwen3VLMoeForConditionalGeneration,
     Qwen3VLForConditionalGeneration,
     AutoProcessor,
 )
@@ -97,7 +95,7 @@ def preprocess(batch) -> dict[str, list[Tensor] | list[str]]:
 
 
 ds: IterableDataset = load_dataset(  # pyrefly:ignore
-    "common-canvas/commoncatalog-cc-by", streaming=True, split="train"
+    "hdtech/SA-1B", streaming=True, split="train"
 )
 
 

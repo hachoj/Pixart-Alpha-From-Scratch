@@ -5,16 +5,24 @@ import sys
 import time
 from typing import List, Optional
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
 import gradio as gr
 import hydra
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
-from train_stage1 import generate_samples
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+from app.reprompt import reprompt as reprompt_prompt
+from train_stage2 import generate_samples
+
 NUM_STEPS = 24
+TEXT_ENCODER_NAME = "google/t5gemma-xl-xl-ul2"
+DEFAULT_INIT_CKPT = "/home/chojnowski.h/weishao/chojnowski.h/Pixart-Alpha/checkpoints_stage1/new_reparameterized_model.pt"
 
 
 def _status_html(message: str, kind: str = "info") -> str:
@@ -25,6 +33,8 @@ def _resolve_checkpoint_path(cfg: DictConfig) -> str:
     ckpt_path = cfg.get("ckpt_path")
     if not ckpt_path:
         ckpt_path = OmegaConf.select(cfg, "train.resume_path")
+    if not ckpt_path and os.path.exists(DEFAULT_INIT_CKPT):
+        ckpt_path = DEFAULT_INIT_CKPT
     if not ckpt_path:
         return ""
     ckpt_path = os.path.expanduser(ckpt_path)
@@ -33,8 +43,19 @@ def _resolve_checkpoint_path(cfg: DictConfig) -> str:
     return os.path.abspath(ckpt_path)
 
 
+def _build_model_from_cfg(cfg: DictConfig) -> torch.nn.Module:
+    model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
+    if not isinstance(model_cfg, dict):
+        raise TypeError("Model config must resolve to a dictionary.")
+    target = model_cfg.pop("_target_", None)
+    if not target:
+        raise ValueError("Model config is missing _target_.")
+    model_cls = hydra.utils.get_class(target)
+    return model_cls(**model_cfg)
+
+
 def _load_models(cfg: DictConfig, device: torch.device):
-    model = hydra.utils.instantiate(cfg.model)
+    model = _build_model_from_cfg(cfg)
     model_ema = copy.deepcopy(model)
 
     ckpt_path = _resolve_checkpoint_path(cfg)
@@ -70,6 +91,16 @@ def _load_vae(cfg: DictConfig, device: torch.device):
     for param in vae.parameters():
         param.requires_grad = False
     return vae
+
+
+def _load_text_encoder(device: torch.device):
+    tokenizer = AutoTokenizer.from_pretrained(TEXT_ENCODER_NAME)
+    text_encoder = AutoModelForSeq2SeqLM.from_pretrained(TEXT_ENCODER_NAME)
+    text_encoder = text_encoder.model
+    text_encoder = text_encoder.to(device=device, dtype=torch.bfloat16).eval()
+    for param in text_encoder.parameters():
+        param.requires_grad = False
+    return tokenizer, text_encoder
 
 
 def _validate_integer(value: Optional[float]) -> Optional[int]:
@@ -117,7 +148,7 @@ def _save_gif(frames: List[Image.Image], output_dir: str) -> str:
         raise ValueError("No frames available to build GIF.")
     os.makedirs(output_dir, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    out_path = os.path.join(output_dir, f"stage1_sample_{stamp}_{os.getpid()}.gif")
+    out_path = os.path.join(output_dir, f"stage2_sample_{stamp}_{os.getpid()}.gif")
     frames[0].save(
         out_path,
         save_all=True,
@@ -129,77 +160,235 @@ def _save_gif(frames: List[Image.Image], output_dir: str) -> str:
 
 
 CSS = """
+@import url("https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;600&family=Space+Grotesk:wght@400;600;700&display=swap");
+
 :root {
-  --m3-primary: #0b6bcb;
-  --m3-primary-variant: #0856a6;
-  --m3-surface: #f7f7fb;
-  --m3-card: #ffffff;
-  --m3-outline: #d6dae2;
-  --m3-text: #1c1b1f;
-  --m3-muted: #5f6368;
+  --bg: #fbf3e6;
+  --text: #111111;
+  --muted: #5b5b5b;
+  --card: rgba(255, 255, 255, 0.84);
+  --border: rgba(15, 15, 15, 0.07);
+  --accent-1: #ff3a2e;
+  --accent-2: #ff6fb1;
+  --accent-3: #6c65ff;
+  --panel: rgba(255, 255, 255, 0.92);
 }
 body, .gradio-container {
-  font-family: "Manrope", "DM Sans", "Source Sans 3", sans-serif;
-  background:
-    radial-gradient(1200px 600px at 10% -10%, #e9f2ff 0%, rgba(233,242,255,0) 60%),
-    radial-gradient(900px 500px at 90% 0%, #f3f9f5 0%, rgba(243,249,245,0) 55%),
-    #f5f6fb;
-  color: var(--m3-text);
+  font-family: "Space Grotesk", "Instrument Sans", sans-serif;
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(1200px 600px at 8% 8%, rgba(255, 72, 68, 0.18), transparent 60%),
+    radial-gradient(900px 520px at 92% 12%, rgba(114, 109, 255, 0.2), transparent 60%),
+    radial-gradient(800px 520px at 70% 80%, rgba(255, 111, 181, 0.25), transparent 65%),
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160' viewBox='0 0 160 160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='2' stitchTiles='stitch'/></filter><rect width='160' height='160' filter='url(%23n)' opacity='0.22'/></svg>");
+  background-size: auto, auto, auto, 180px 180px;
+  background-blend-mode: normal, normal, normal, soft-light;
+  color: var(--text);
+}
+body::before,
+body::after {
+  content: "";
+  position: fixed;
+  width: 520px;
+  height: 520px;
+  border-radius: 999px;
+  filter: blur(70px);
+  opacity: 0.45;
+  z-index: 0;
+  pointer-events: none;
+}
+body::before {
+  top: -120px;
+  right: 5%;
+  background: radial-gradient(circle, rgba(255, 111, 181, 0.55), rgba(255, 58, 46, 0));
+}
+body::after {
+  bottom: -160px;
+  left: 6%;
+  background: radial-gradient(circle, rgba(92, 104, 255, 0.5), rgba(92, 104, 255, 0));
 }
 #app-shell {
   max-width: 1200px;
   margin: 0 auto;
+  padding: 28px 24px 36px;
+  position: relative;
+  z-index: 1;
 }
 #header {
-  background: linear-gradient(135deg, #0b6bcb, #2bb673);
-  color: white;
-  border-radius: 18px;
-  padding: 20px 24px;
-  margin-bottom: 18px;
-  box-shadow: 0 12px 24px rgba(11, 107, 203, 0.2);
+  background: transparent;
+  color: var(--text);
+  border-radius: 0;
+  padding: 0 4px 12px;
+  margin-bottom: 24px;
+  box-shadow: none;
+}
+.hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  align-items: center;
+}
+.hero-title {
+  font-size: clamp(2.6rem, 4vw, 4.4rem);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 0.95;
+}
+.hero-subtitle {
+  font-size: clamp(2.2rem, 3.4vw, 3.6rem);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1;
+  margin-top: 8px;
+}
+.hero-caption {
+  font-family: "Instrument Sans", sans-serif;
+  font-size: 1rem;
+  color: var(--muted);
+  margin-top: 12px;
+  max-width: 520px;
+}
+.gradient-word {
+  background: linear-gradient(90deg, #ff3a2e 0%, #ff6fb1 45%, #6c65ff 75%, #3a4aff 100%);
+  background-size: 200% 200%;
+  color: transparent;
+  -webkit-background-clip: text;
+  background-clip: text;
+  animation: gradientShift 6s ease infinite;
 }
 .section-card {
-  background: var(--m3-card);
-  border: 1px solid var(--m3-outline);
-  border-radius: 16px;
-  padding: 16px;
-  box-shadow: 0 10px 22px rgba(15, 23, 42, 0.08);
+  position: relative;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 18px;
+  box-shadow: 0 16px 34px rgba(12, 12, 12, 0.12);
+  backdrop-filter: blur(14px);
+  animation: rise 0.6s ease both;
+  overflow: hidden;
+}
+.section-card::after {
+  content: "";
+  position: absolute;
+  inset: 40% -20% -40% 45%;
+  background: radial-gradient(circle, rgba(255, 111, 181, 0.18), transparent 65%);
+  filter: blur(30px);
+  opacity: 0.7;
+}
+.section-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 46px;
+  background: linear-gradient(
+    90deg,
+    rgba(255, 58, 46, 0.18),
+    rgba(255, 111, 181, 0.18),
+    rgba(92, 104, 255, 0.18)
+  );
+  opacity: 0.5;
+}
+.section-card > * {
+  position: relative;
 }
 .section-title {
   font-weight: 600;
   font-size: 1.05rem;
-  color: var(--m3-text);
+  color: var(--text);
   margin-bottom: 8px;
 }
+.gradio-container label span {
+  font-family: "Instrument Sans", sans-serif;
+  font-weight: 600;
+  color: #383838;
+}
+.gradio-container input,
+.gradio-container textarea {
+  background: var(--panel);
+  border: 1px solid rgba(15, 15, 15, 0.08);
+  border-radius: 14px;
+  padding: 12px 14px;
+  font-family: "Instrument Sans", sans-serif;
+  font-size: 0.98rem;
+}
+.gradio-container input:focus,
+.gradio-container textarea:focus {
+  border-color: rgba(255, 58, 46, 0.35);
+  box-shadow: 0 0 0 3px rgba(255, 58, 46, 0.12);
+}
 #generate-btn {
-  background: var(--m3-primary);
+  background: linear-gradient(90deg, #ff3a2e 0%, #ff6fb1 50%, #6c65ff 100%);
   border: none;
   color: white;
   font-weight: 600;
-  padding: 12px 18px;
-  border-radius: 12px;
-  box-shadow: 0 10px 20px rgba(11, 107, 203, 0.25);
+  padding: 12px 22px;
+  border-radius: 999px;
+  box-shadow: 0 14px 30px rgba(255, 79, 79, 0.3);
+  letter-spacing: 0.02em;
 }
 #generate-btn:hover {
-  background: var(--m3-primary-variant);
+  filter: brightness(1.03);
+}
+#generate-btn:active {
+  transform: translateY(1px);
+}
+.gradio-container .gr-input,
+.gradio-container .gr-number,
+.gradio-container .gr-textbox {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+.gradio-container .gr-form {
+  gap: 12px;
+}
+.gradio-container .gr-box {
+  background: var(--panel);
+  border: 1px solid rgba(15, 15, 15, 0.08);
+  border-radius: 16px;
+  box-shadow: 0 12px 30px rgba(16, 24, 40, 0.08);
+}
+.gradio-container .gr-image {
+  border-radius: 16px;
+  overflow: hidden;
+  border: 1px solid rgba(15, 15, 15, 0.06);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6);
 }
 #status .status {
-  background: #eef2ff;
-  border: 1px solid #d6dcff;
-  color: #1e3a8a;
-  padding: 10px 12px;
-  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.85);
+  border: 1px solid rgba(15, 15, 15, 0.1);
+  color: var(--text);
+  padding: 12px 14px;
+  border-radius: 14px;
   font-size: 0.95rem;
 }
 #status .status.error {
-  background: #fff1f2;
-  border-color: #fecdd3;
-  color: #9f1239;
+  background: rgba(255, 225, 225, 0.9);
+  border-color: rgba(255, 58, 46, 0.35);
+  color: #9b1c1c;
 }
 #status .status.success {
-  background: #ecfdf3;
-  border-color: #bbf7d0;
+  background: rgba(227, 255, 236, 0.9);
+  border-color: rgba(22, 163, 74, 0.3);
   color: #166534;
+}
+.meta {
+  font-family: "Instrument Sans", sans-serif;
+  color: var(--muted);
+}
+@keyframes gradientShift {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+@keyframes rise {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@media (max-width: 900px) {
+  .hero {
+    grid-template-columns: 1fr;
+  }
 }
 """
 
@@ -339,7 +528,7 @@ def _parse_cli(argv: List[str]):
 
 
 def _resolve_gradio_kwargs():
-    blocks_kwargs = {"title": "Stage 1 Sampler", "elem_id": "app-shell"}
+    blocks_kwargs = {"title": "Stage 2 Sampler", "elem_id": "app-shell"}
     launch_kwargs = {}
 
     launch_params = inspect.signature(gr.Blocks.launch).parameters
@@ -375,10 +564,12 @@ def main() -> None:
     cfg = _compose_config(config_dir, config_name, overrides)
 
     model = model_ema = sampling_model = vae = None
+    tokenizer = text_encoder = None
     load_error = None
     try:
         model, model_ema, sampling_model, ckpt_path = _load_models(cfg, device)
         vae = _load_vae(cfg, device)
+        tokenizer, text_encoder = _load_text_encoder(device)
     except Exception as exc:
         ckpt_path = _resolve_checkpoint_path(cfg)
         load_error = str(exc)
@@ -386,9 +577,18 @@ def main() -> None:
 
     blocks_kwargs, launch_kwargs = _resolve_gradio_kwargs()
     with gr.Blocks(**blocks_kwargs) as demo:
-        gr.Markdown(
-            "# PixArt-Alpha Stage 1 Sampler\n"
-            "Generate samples with the Stage 1 model using the same validation sampling path.",
+        gr.HTML(
+            """
+            <div class="hero">
+              <div class="hero-text">
+                <div class="hero-title">PixArt-Alpha</div>
+                <div class="hero-subtitle"><span class="gradient-word">Stage 2</span> sampler</div>
+                <div class="hero-caption">
+                  Prompt -> reprompt -> text-conditioned sampling with optional seeding.
+                </div>
+              </div>
+            </div>
+            """,
             elem_id="header",
         )
 
@@ -396,10 +596,10 @@ def main() -> None:
             with gr.Column(scale=4, min_width=320):
                 with gr.Group(elem_classes="section-card"):
                     gr.Markdown("Inputs", elem_classes="section-title")
-                    class_id = gr.Number(
-                        label="ImageNet class id (0-1000)",
-                        precision=0,
-                        value=2,
+                    prompt = gr.Textbox(
+                        label="Prompt",
+                        lines=3,
+                        placeholder="Describe the scene you want to generate.",
                     )
                     seed = gr.Number(
                         label="Seed (optional)",
@@ -441,22 +641,23 @@ def main() -> None:
         def enable_button():
             return gr.update(interactive=True)
 
-        def generate(class_id_value, seed_value, progress=gr.Progress()):
-            if load_error is not None or sampling_model is None or vae is None:
+        def generate(prompt_value, seed_value, progress=gr.Progress()):
+            if (
+                load_error is not None
+                or sampling_model is None
+                or vae is None
+                or tokenizer is None
+                or text_encoder is None
+            ):
                 return None, None, _status_html(
-                    "Error: model or VAE failed to load. Check the checkpoint path.",
+                    "Error: model components failed to load. Check the checkpoint path.",
                     kind="error",
                 )
             start_time = time.time()
-            class_id_int = _validate_integer(class_id_value)
-            if class_id_int is None:
+            prompt_text = (prompt_value or "").strip()
+            if not prompt_text:
                 return None, None, _status_html(
-                    "Error: class id must be an integer between 0 and 1000.",
-                    kind="error",
-                )
-            if not (0 <= class_id_int <= 1000):
-                return None, None, _status_html(
-                    "Error: class id must be in the range [0, 1000].",
+                    "Error: prompt is required.",
                     kind="error",
                 )
 
@@ -468,7 +669,32 @@ def main() -> None:
                 )
 
             try:
-                progress(0, desc="Preparing noise")
+                progress(0, desc="Reprompting")
+                reprompted = reprompt_prompt(prompt_text)
+
+                progress(0.1, desc="Tokenizing")
+                max_length = int(OmegaConf.select(cfg, "train.max_input_length") or 100)
+                tokenized = tokenizer(
+                    reprompted,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=max_length,
+                    return_tensors="pt",
+                )
+                tokenized = {
+                    "input_ids": tokenized["input_ids"].to(device=device),
+                    "attention_mask": tokenized["attention_mask"].to(device=device),
+                }
+                with torch.inference_mode():
+                    with torch.autocast(
+                        device_type=device.type,
+                        dtype=torch.bfloat16,
+                        enabled=(device.type == "cuda"),
+                    ):
+                        text_tokens = text_encoder.encoder(**tokenized).last_hidden_state
+                text_mask = tokenized["attention_mask"].bool()
+
+                progress(0.2, desc="Preparing noise")
                 generator = None
                 if seed_int is not None:
                     generator = torch.Generator(device=device)
@@ -480,26 +706,22 @@ def main() -> None:
                     device=device,
                     generator=generator,
                 )
-                labels = torch.tensor(
-                    [class_id_int],
-                    device=device,
-                    dtype=torch.long,
-                )
 
-                progress(0.15, desc="Sampling 24 steps")
+                progress(0.35, desc="Sampling 24 steps")
                 with torch.inference_mode():
                     latents = generate_samples(
                         sampling_model,
                         noise,
-                        labels,
+                        text_tokens,
+                        text_mask,
                         num_steps=NUM_STEPS,
                         num_save_steps=NUM_STEPS,
                     )
 
-                progress(0.65, desc="Decoding frames")
+                progress(0.7, desc="Decoding frames")
                 frames = _decode_latents_to_frames(vae, latents, cfg)
 
-                progress(0.85, desc="Building GIF")
+                progress(0.88, desc="Building GIF")
                 gif_path = _save_gif(
                     frames,
                     output_dir=os.path.join(REPO_ROOT, "outputs", "gradio"),
@@ -529,7 +751,7 @@ def main() -> None:
             queue=False,
         ).then(
             fn=generate,
-            inputs=[class_id, seed],
+            inputs=[prompt, seed],
             outputs=[gif_output, final_output, status],
         ).then(
             fn=enable_button,

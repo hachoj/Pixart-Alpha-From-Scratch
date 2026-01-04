@@ -107,7 +107,9 @@ def single_sample_fn(
 
 
 @torch.inference_mode()
-def generate_samples(model, noise, text_tokens, text_mask, num_steps=24, num_save_steps=6):
+def generate_samples(
+    model, noise, text_tokens, text_mask, num_steps=24, num_save_steps=6
+):
     text_tokens = text_tokens.to(device=noise.device)
     text_mask = text_mask.to(device=noise.device)
     if text_mask.dtype is not torch.bool:
@@ -186,13 +188,20 @@ def train(
     validation_noise = None
     validation_text_tokens = None
     validation_text_mask = None
+    validation_text_original = None
     validation_text = []
     if is_main:
+        validation_text_original = [
+            "Make an image of a dog on a big red ball.",
+            "An image of a neon sign, saying big dog, on the top of a building in the rain.",
+            "The worlds smallest fish.",
+            "A pretty couple holding hands.",
+        ]
         validation_text = [
-            "A fractured concrete stairwell spirals downward inside a cylindrical shaft, its chipped edges exposing layered aggregate and rust-stained rebar. Cool directional light from a circular skylight creates sharp radial shadows, emphasizing rough textures and high-frequency surface noise. The palette is desaturated gray and ochre, with dark voids between steps fading into low-contrast black.",
-            "A transparent glass cube rests on a matte black plane, containing suspended metallic spheres of varying diameters arranged in a precise lattice. Hard studio lighting produces crisp caustics, mirrored reflections, and specular highlights that refract through the cube’s beveled edges. The color scheme is minimal, dominated by clear glass, chrome silver, and deep neutral blacks.",
-            "A high-speed macro view of a water droplet impacts a shallow liquid surface, forming a crown-shaped splash with thin upward jets and micro-beaded rims. Backlighting creates bright rim highlights and translucent gradients within the fluid structures, freezing fine surface tension details. The background is uniformly dark, contrasting with the pale blue-gray liquid and sharp white highlights.",
-            "A big red car.",
+            "Dog on a large red ball, fluffy fur, soft texture, warm red coloration, rounded body shape, smooth surface, raised on the ball, visible legs, slightly elevated position, close-up view, bright lighting, clean background. The dog is stationary, calm, full of energy, natural posture, smooth coat, natural shadows, high contrast, clear focus.",
+            "Neon sign glowing in bright red and white, bold text reading 'big dog' on a vertical surface, illuminated against dark sky. Raindrops falling on the sign, wet reflective surface, glass panels showing blurred light patterns. Building facade with vertical lines, weathered metal texture, dark silhouette, urban environment, dim lighting, low-angle view.",
+            "Tiny fish with elongated body, translucent fins, delicate scales, shimmering silver coloration, compact form, narrow head, small eyes, smooth texture, reflective surface, low volume, small size, close-up, tight focus, shallow depth, aquatic environment, shallow water, sunlit surface, clear water, minimal motion, stillness, natural lighting, subtle reflections, intricate details, high contrast, soft shadows, close-up view, detailed anatomy, minimal background, isolated subject, no other elements.",
+            "A woman and man standing close together, both wearing light-colored shirts, their arms gently intertwined, soft skin tones, smooth fabric texture, natural sunlight illuminating their faces, warm golden hour light, slightly blurred background, intimate proximity, subtle shadows on their shoulders, calm and serene expressions, slightly parted lips, close physical contact, peaceful atmosphere.",
         ]
         validation_noise = torch.randn(
             (1, 16, 32, 32), dtype=torch.float32, device=device
@@ -273,7 +282,9 @@ def train(
             Xt = t_mult * X1 + (1 - t_mult) * X0
             V = X1 - X0
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):  # pyrefly:ignore
+            with torch.autocast(
+                device_type="cuda", dtype=torch.bfloat16
+            ):  # pyrefly:ignore
                 input_ids = {
                     "input_ids": long,
                     "attention_mask": long_mask,
@@ -293,7 +304,6 @@ def train(
 
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
-
 
         if cfg.wandb.enabled and (step + 1) % cfg.train.every_n_steps == 0:
             loss_detached = loss_sum
@@ -357,6 +367,7 @@ def train(
                 validation_noise is not None
                 and validation_text_tokens is not None
                 and validation_text_mask is not None
+                and validation_text_original is not None
             )
             with torch.inference_mode():
                 generated_latents_ema = generate_samples(
@@ -427,7 +438,7 @@ def train(
                 )
 
             caption = "Left: EMA | Right: Regular.\n" + "\n".join(
-                [f"Row {i}: {text}" for i, text in enumerate(validation_text)]
+                [f"Row {i}: {text}" for i, text in enumerate(validation_text_original)]
             )
             wandb.log({"image/examples": wandb.Image(decoded_images, caption=caption)})
             start_time = time.time()
@@ -500,7 +511,9 @@ def main(cfg: DictConfig):
         print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
         vae = vae.to(device=device)
         print(f"VAE number of parameters: {sum(p.numel() for p in vae.parameters())}")
-        print(f"Gemma number of parameters: {sum(p.numel() for p in gemma.parameters())}")
+        print(
+            f"Gemma number of parameters: {sum(p.numel() for p in gemma.parameters())}"
+        )
 
     # move to devices
     model = model.to(device=device)
