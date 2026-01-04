@@ -248,25 +248,10 @@ def train(
             # loading the data onto the GPU, basically just a speed up that
             # required pin memory also to be True
             latents = batch[0].to(device=device, non_blocking=True)
-            short = batch[1].to(device=device, non_blocking=True, dtype=torch.long)
-            short_mask = batch[2].to(device=device, non_blocking=True, dtype=torch.long)
-            long = batch[3].to(device=device, non_blocking=True, dtype=torch.long)
-            long_mask = batch[4].to(device=device, non_blocking=True, dtype=torch.long)
+            caption = batch[1].to(device=device, non_blocking=True, dtype=torch.long)
+            caption_mask = batch[2].to(device=device, non_blocking=True, dtype=torch.long)
 
             B = latents.shape[0]
-
-            # short cpation ratio
-            num_drop = int(B * cfg.train.cfg_p)
-            if num_drop > 0:
-                indx = torch.randint(
-                    0,
-                    B,
-                    (num_drop,),
-                    device=short.device,
-                    dtype=torch.long,
-                )
-                long[indx] = short[indx]
-                long_mask[indx] = short_mask[indx]
 
             X1 = latents.to(dtype=torch.bfloat16) * scaling_factor
             # Mean shift to 0
@@ -286,12 +271,12 @@ def train(
                 device_type="cuda", dtype=torch.bfloat16
             ):  # pyrefly:ignore
                 input_ids = {
-                    "input_ids": long,
-                    "attention_mask": long_mask,
+                    "input_ids": caption,
+                    "attention_mask": caption_mask,
                 }
                 with torch.no_grad():
                     text_embed = gemma.encoder(**input_ids).last_hidden_state
-                text_mask = long_mask.bool()
+                text_mask = caption_mask.bool()
                 pred = model(Xt, t, text_embed, text_mask)
 
             loss = F.mse_loss(V, pred) / cfg.train.grad_accum
