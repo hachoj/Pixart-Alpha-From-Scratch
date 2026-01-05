@@ -1,16 +1,16 @@
 #!/bin/bash
 
-#SBATCH --job-name=b200_multi_node_2x4
+#SBATCH --job-name=b200_multi_node
 #SBATCH --ntasks=2
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=4
+#SBATCH --gpus-per-node=2
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=96gb
+#SBATCH --mem=64gb
 #SBATCH --account=weishao
 #SBATCH --qos=weishao
 #SBATCH --partition=hpg-b200
 
-#SBATCH --time=144:00:00
+#SBATCH --time=00:30:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 mkdir -p logs
@@ -25,7 +25,6 @@ hostname;date;pwd
 module purge
 module load mamba
 mamba activate torch
-
 export XDG_RUNTIME_DIR=${SLURM_TMPDIR}
 export OMP_NUM_THREADS=1
 
@@ -47,4 +46,4 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
     --rdzv_id=$RDZV_ID \
-    train_stage2.py
+    train_stage1.py
