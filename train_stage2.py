@@ -1,5 +1,4 @@
 import copy
-import gc
 import os
 import re
 import time
@@ -9,6 +8,8 @@ import hydra
 import numpy as np
 import torch
 import torch.distributed as dist
+import transformer_engine.pytorch as te
+from transformer_engine.common.recipe import Format, MXFP8BlockScaling
 import torch.nn as nn
 import torch.nn.functional as F
 import torchdiffeq
@@ -17,7 +18,6 @@ from einops import rearrange, repeat
 from omegaconf import DictConfig
 from torch import Tensor
 from torch.amp import autocast
-from torch.distributed import destroy_process_group, init_process_group
 
 # DDP Code
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -177,6 +177,10 @@ def train(
         wandb.define_metric("train/*", step_metric="train_step")
         wandb.define_metric("image/*", step_metric="train_step")
 
+    # --- Transformer engine stuff ---
+    mxfp8_format = Format.E4M3
+    mxfp8_recipe = MXFP8BlockScaling(fp8_format=mxfp8_format)
+
     model_ema.eval()
     gemma.eval()
     vae.eval()
@@ -249,7 +253,9 @@ def train(
             # required pin memory also to be True
             latents = batch[0].to(device=device, non_blocking=True)
             caption = batch[1].to(device=device, non_blocking=True, dtype=torch.long)
-            caption_mask = batch[2].to(device=device, non_blocking=True, dtype=torch.long)
+            caption_mask = batch[2].to(
+                device=device, non_blocking=True, dtype=torch.long
+            )
 
             B = latents.shape[0]
 
@@ -277,6 +283,8 @@ def train(
                 with torch.no_grad():
                     text_embed = gemma.encoder(**input_ids).last_hidden_state
                 text_mask = caption_mask.bool()
+
+            with te.autocast(enabled=True, recipe=mxfp8_recipe):
                 pred = model(Xt, t, text_embed, text_mask)
 
             loss = F.mse_loss(V, pred) / cfg.train.grad_accum
@@ -473,10 +481,10 @@ def main(cfg: DictConfig):
     tokenizer = AutoTokenizer.from_pretrained("google/t5gemma-xl-xl-ul2")
     gemma = AutoModelForSeq2SeqLM.from_pretrained(
         "google/t5gemma-xl-xl-ul2",
+        torch_dtype=torch.bfloat16,
         device_map={"": device},
     )
     gemma = gemma.model
-    gemma = gemma.to(dtype=torch.bfloat16)
 
     step_start = 0
 

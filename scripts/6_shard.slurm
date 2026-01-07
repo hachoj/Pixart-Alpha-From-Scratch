@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=1_shard
+#SBATCH --job-name=6_shard
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=1
@@ -10,7 +10,7 @@
 #SBATCH --qos=weishao
 #SBATCH --partition=hpg-b200
 
-#SBATCH --time=06:00:00
+#SBATCH --time=10:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 mkdir -p logs
@@ -26,4 +26,4 @@ module purge
 module load mamba
 mamba activate core
 
-python data/shard_imgnet_21_vllm.py --rank 1 --world-size 8
+python data/shard_imgnet_21_vllm.py --rank 6 --world-size 8

@@ -220,9 +220,8 @@ def main(args):
     mask_buf = torch.empty((RECORDS_PER_SHARD, MAX_TOKENS), dtype=torch.int8)
 
     record_idx = 0
-    shards_per_rank = TOTAL_SHARDS // args.world_size
-    extra_shards = TOTAL_SHARDS % args.world_size
-    shard_number = args.rank * shards_per_rank + min(args.rank, extra_shards)
+
+    shard_number = args.rank
 
     for data in dataloader:
         iter_start = time.perf_counter()
@@ -298,7 +297,7 @@ def main(args):
                 },
                 save_path,
             )
-            shard_number += 1
+            shard_number += args.world_size
             record_idx = 0
             latent_buf = torch.empty((RECORDS_PER_SHARD, 16, 32, 32), dtype=torch.bfloat16)
             token_buf = torch.empty((RECORDS_PER_SHARD, MAX_TOKENS), dtype=torch.int32)

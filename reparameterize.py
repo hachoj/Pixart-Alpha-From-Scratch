@@ -6,7 +6,9 @@ import torch.nn.functional as F
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
-from models.mmDiT.dit import DiT
+from models_fp8.mmDiT.dit import DiT as mmDiT
+from models.ccDiT.dit import DiT as ccDiT
+from models_fp8.ccDiT.dit import DiT as ccDiT_fp8
 
 
 @torch.no_grad()
@@ -35,8 +37,8 @@ def reparameterize(model, E, c, adaln1w, adaln1b, ada1w, ada1b, ada2w, ada2b):
 
 @torch.no_grad()
 def create_embeddings(model):
-    t = torch.tensor(0.5).float()
-    label = torch.tensor(1000).long()
+    t = torch.tensor(0.5).float().to(device='cuda')
+    label = torch.tensor(1000).long().to(device='cuda')
     t = t.unsqueeze(0)
     label = label.unsqueeze(0)
 
@@ -71,40 +73,64 @@ def create_embeddings(model):
     )
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="config")
-def main(cfg: DictConfig):
+def main():
     """
     Make sure you are using the hydra confg
     for the stage 1 training not stage 2
     """
-    print("Creating model...")
-    model = hydra.utils.instantiate(cfg.model)
+    ccDiT_config: dict[str, int] = {
+        "in_dim": 16,
+        "dim": 1152,
+        "cond_dim": 256,
+        "num_heads": 16,
+        "mlp_ratio": 4,
+        "num_blocks": 28,
+        "patch_size": 2,
+        "num_classes": 1001,
+        "base_image_size": 32,
+    }
+    mmDiT_config: dict[str, int] = {
+        "in_dim": 16,
+        "dim": 1152,
+        "cond_dim": 256,
+        "text_dim": 2048,
+        "num_heads": 16,
+        "mlp_ratio": 4,
+        "num_blocks": 28,
+        "patch_size": 2,
+        "base_image_size": 32,
+    }
+    # cc_model = ccDiT(**ccDiT_config)
+    mm_fp8_model = mmDiT(**mmDiT_config)
+    cc_fp8_model = ccDiT_fp8(**ccDiT_config)
 
-    print("Loading pretrained weights...")
-    resume_dict = torch.load(
-        os.path.abspath("checkpoints/model_300000.pt"), map_location="cpu"
+    cc_resume_dict = torch.load(
+        os.path.abspath("checkpoints_stage1/transformer_engine_model.pt"), map_location="cpu"
     )
 
-    model.load_state_dict(resume_dict["model_ema"])
+    cc_fp8_model.load_state_dict(cc_resume_dict)
+
+    mm_fp8_model.to(device='cuda')
+    cc_fp8_model.to(device='cuda')
+
+    # save_path = os.path.abspath("checkpoints_stage1/transformer_engine_model.pt")
+    # torch.save(cc_fp8_model.state_dict(), save_path)
 
     print("Creating reparameterized model...")
-    new_config: dict = OmegaConf.to_container(cfg.model, resolve=True)  # pyrefly:ignore
-    new_config.pop("_target_", None)
-    new_config.pop("num_classes", None)
-    new_config["text_dim"] = 2048
-    new_model = DiT(**new_config)
-    E, c, adaln1w, adaln1b, ada1w, ada1b, ada2w, ada2b = create_embeddings(model)
+    E, c, adaln1w, adaln1b, ada1w, ada1b, ada2w, ada2b = create_embeddings(cc_fp8_model)
 
     print("Reparameterizing model...")
-    new_model = reparameterize(
-        new_model, E, c, adaln1w, adaln1b, ada1w, ada1b, ada2w, ada2b
+    mm_fp8_model = reparameterize(
+        mm_fp8_model, E, c, adaln1w, adaln1b, ada1w, ada1b, ada2w, ada2b
     )
 
     print("Saving reparameterized model...")
-    save_path = os.path.abspath("checkpoints/new_reparameterized_model.pt")
-    torch.save(new_model.state_dict(), save_path)
+    save_path = os.path.abspath("checkpoints_stage1/reparameterized_transformer_engine_model.pt")
+    torch.save(mm_fp8_model.state_dict(), save_path)
     print(f"Saved reparameterized model to {save_path}")
 
 
 if __name__ == "__main__":
     main()
+    # THE NEW PLAN IS TO HAVE MULTIPLE FUNCCTIONS HERE, ONE FOR REGULAR TO TE
+    # THEN THE REPARAMETERIZE, AND THE CODE SHOULD JUST BE BETTER.

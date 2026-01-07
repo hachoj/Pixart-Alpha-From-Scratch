@@ -29,6 +29,7 @@ Output only the rewritten prompt.
 
 Prompt: """
 
+
 @functools.lru_cache(maxsize=1)
 def _load_model():
     processor = AutoProcessor.from_pretrained(MODEL_NAME, padding_side="left")
@@ -77,16 +78,23 @@ def reprompt(prompt: str) -> str:
         )
 
     generated_ids_trimmed = [
-        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        out_ids[len(in_ids) :]
+        for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
     ]
     output_text = processor.batch_decode(  # pyrefly:ignore
-        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        generated_ids_trimmed,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
     )
     return output_text[0].strip()
 
 
 if __name__ == "__main__":
     print(reprompt("Make an image of a dog on a big red ball."))
-    print(reprompt("An image of a neon sign, saying big dog, on the top of a building in the rain."))
+    print(
+        reprompt(
+            "An image of a neon sign, saying big dog, on the top of a building in the rain."
+        )
+    )
     print(reprompt("The worlds smallest fish."))
     print(reprompt("A pretty couple holding hands."))

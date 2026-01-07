@@ -10,7 +10,7 @@ ema_init: 0.01
 ema_warmup: 3000
 
 checkpoint_dir: "checkpoints/"
-checkpoint_init_dir: "checkpoints_stage1/new_reparameterized_model.pt"
+checkpoint_init_dir: "checkpoints_stage1/reparameterized_transformer_engine_model.pt"
 seed: 42
 lr: 1e-4
 warmup_steps: 2000

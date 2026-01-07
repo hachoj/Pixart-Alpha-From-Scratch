@@ -103,16 +103,14 @@ class LatentShardDatasetStage2(IterableDataset):
                 data = torch.load(shard_path, map_location="cpu")
 
                 latents = data['latents']
-                short_caption = data['short_caption']
-                short_caption_mask = data['short_caption_mask']
-                long_caption = data['long_caption']
-                long_caption_mask = data['long_caption_mask']
+                text_tokens = data['text_tokens']
+                attention_mask = data['attention_mask']
 
                 idx = list(range(len(latents)))
                 rng.shuffle(idx)
 
                 for i in idx:
-                    yield (latents[i], short_caption[i], short_caption_mask[i], long_caption[i], long_caption_mask[i])
+                    yield (latents[i], text_tokens[i], attention_mask[i])
                 
             epoch += 1
             

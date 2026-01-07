@@ -10,7 +10,7 @@
 #SBATCH --qos=weishao
 #SBATCH --partition=hpg-b200
 
-#SBATCH --time=06:00:00
+#SBATCH --time=10:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 mkdir -p logs
