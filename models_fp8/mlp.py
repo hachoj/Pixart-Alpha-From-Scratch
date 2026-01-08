@@ -17,6 +17,7 @@ class MLP(nn.Module):
             out_features=hidden_dim,
             bias=True,
             init_method=lambda w: nn.init.kaiming_normal_(w, mode="fan_in"),
+            fuse_wgrad_accumulation=True,
         )
         self.act = nn.SiLU()
         self.linear2 = te.Linear(
@@ -24,6 +25,7 @@ class MLP(nn.Module):
             out_features=dim,
             bias=True,
             init_method=lambda w: nn.init.zeros_(w),
+            fuse_wgrad_accumulation=True,
         )
 
     def forward(

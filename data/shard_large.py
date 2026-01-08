@@ -41,7 +41,7 @@ def serialize(mean, short_caption, long_caption):
 vae = AutoencoderKL.from_pretrained(
     "stabilityai/stable-diffusion-3-medium-diffusers",
     subfolder="vae",
-    torch_dtype=torch.bfloat16,
+    dtype=torch.bfloat16,
 ).to(device="cuda")
 
 model_name = "Qwen/Qwen3-VL-2B-Instruct"

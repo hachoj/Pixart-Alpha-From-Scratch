@@ -115,7 +115,7 @@ def main(args):
     vae = AutoencoderKL.from_pretrained(
         "stabilityai/stable-diffusion-3-medium-diffusers",
         subfolder="vae",
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
     ).to(device="cuda")
 
     processor = AutoProcessor.from_pretrained(MODEL_NAME, padding_side="left")

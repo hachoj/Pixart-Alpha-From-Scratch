@@ -1,5 +1,5 @@
 total_steps: 150000 # given effetive batch size from grad accumm, true steps would be grad_accum times this number
-batch_size: 304
+batch_size: 320
 grad_accum: 4
 every_n_steps: 10
 every_n_image: 1000

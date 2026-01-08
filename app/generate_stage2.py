@@ -56,7 +56,7 @@ def _load_gemma(device="cuda"):
     tokenizer = AutoTokenizer.from_pretrained("google/t5gemma-xl-xl-ul2")
     gemma = AutoModelForSeq2SeqLM.from_pretrained(
         "google/t5gemma-xl-xl-ul2",
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map={"": device},
     )
     gemma = gemma.model

@@ -1,1 +1,1 @@
-_target_: models.vae.create_vae
+_target_: models_fp8.vae.create_vae

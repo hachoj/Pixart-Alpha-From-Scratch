@@ -1,4 +1,4 @@
-_target_: models.mmDiT.dit.DiT
+_target_: models_fp8.mmDiT.dit.DiT
 in_dim: 16
 dim: 1152
 cond_dim: 256

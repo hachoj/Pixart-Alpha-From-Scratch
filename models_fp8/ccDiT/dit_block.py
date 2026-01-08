@@ -15,17 +15,19 @@ class DiTBlock(nn.Module):
         self.mlp = MLP(dim, mlp_ratio)
 
         self.adaLN1 = te.Linear(
-            in_features=cond_dim, 
+            in_features=cond_dim,
             out_features=dim,
             bias=True,
-            init_method=lambda w: nn.init.kaiming_normal_(w, mode='fan_in')
+            init_method=lambda w: nn.init.kaiming_normal_(w, mode="fan_in"),
+            fuse_wgrad_accumulation=True,
         )
         self.act = nn.SiLU()
         self.adaLN2 = te.Linear(
-            in_features=dim, 
+            in_features=dim,
             out_features=dim * 6,
             bias=True,
-            init_method=lambda w: nn.init.zeros_(w)
+            init_method=lambda w: nn.init.zeros_(w),
+            fuse_wgrad_accumulation=True,
         )
 
     def forward(

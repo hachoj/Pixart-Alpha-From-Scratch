@@ -1,9 +1,31 @@
 import os
 import random
+import warnings
 
 import torch
 import torch.distributed as dist
 from torch.utils.data import IterableDataset, get_worker_info
+
+
+_WARNED_FALLBACK_RANK_WS = False
+
+
+def _get_rank_world_size() -> tuple[int, int, str]:
+    """Return (rank, world_size, source).
+
+    DataLoader workers may not have torch.distributed initialized; torchrun
+    provides RANK/WORLD_SIZE env vars which are inherited by workers.
+    """
+
+    env_rank = os.environ.get("RANK")
+    env_world_size = os.environ.get("WORLD_SIZE")
+    if env_rank is not None and env_world_size is not None:
+        return int(env_rank), int(env_world_size), "env"
+
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size(), "dist"
+
+    return 0, 1, "fallback"
 
 
 class LatentShardDatasetStage1(IterableDataset):
@@ -12,14 +34,6 @@ class LatentShardDatasetStage1(IterableDataset):
         self.seed = seed
 
     def __iter__(self):
-        # --- DDP Setup ---
-        if dist.is_available() and dist.is_initialized():
-            rank = dist.get_rank()
-            world_size = dist.get_world_size()
-        else:
-            rank: int = 0
-            world_size: int = 1
-
         # --- Workers Setup ---
         worker = get_worker_info()
         if worker is None:
@@ -28,6 +42,18 @@ class LatentShardDatasetStage1(IterableDataset):
         else:
             worker_id = worker.id
             num_workers = worker.num_workers
+
+        # --- DDP Setup ---
+        rank, world_size, source = _get_rank_world_size()
+        global _WARNED_FALLBACK_RANK_WS
+        if source == "fallback" and worker_id == 0 and not _WARNED_FALLBACK_RANK_WS:
+            warnings.warn(
+                "LatentShardDatasetStage1: torch.distributed not initialized and "
+                "RANK/WORLD_SIZE not set; falling back to rank=0/world_size=1. "
+                "In multi-GPU runs with DataLoader workers, this can duplicate data.",
+                RuntimeWarning,
+            )
+            _WARNED_FALLBACK_RANK_WS = True
 
         # --- Distriute Shards ---
 
@@ -66,14 +92,6 @@ class LatentShardDatasetStage2(IterableDataset):
         self.seed = seed
 
     def __iter__(self):
-        # --- DDP Setup ---
-        if dist.is_available() and dist.is_initialized():
-            rank = dist.get_rank()
-            world_size = dist.get_world_size()
-        else:
-            rank: int = 0
-            world_size: int = 1
-
         # --- Workers Setup ---
         worker = get_worker_info()
         if worker is None:
@@ -82,6 +100,18 @@ class LatentShardDatasetStage2(IterableDataset):
         else:
             worker_id = worker.id
             num_workers = worker.num_workers
+
+        # --- DDP Setup ---
+        rank, world_size, source = _get_rank_world_size()
+        global _WARNED_FALLBACK_RANK_WS
+        if source == "fallback" and worker_id == 0 and not _WARNED_FALLBACK_RANK_WS:
+            warnings.warn(
+                "LatentShardDatasetStage2: torch.distributed not initialized and "
+                "RANK/WORLD_SIZE not set; falling back to rank=0/world_size=1. "
+                "In multi-GPU runs with DataLoader workers, this can duplicate data.",
+                RuntimeWarning,
+            )
+            _WARNED_FALLBACK_RANK_WS = True
 
         # --- Distriute Shards ---
 
@@ -104,12 +134,17 @@ class LatentShardDatasetStage2(IterableDataset):
 
                 latents = data['latents']
                 text_tokens = data['text_tokens']
-                attention_mask = data['attention_mask']
+                attention_mask = data['attn_mask']
 
-                idx = list(range(len(latents)))
-                rng.shuffle(idx)
+                # Filter out invalid/uninitialized records
+                # Valid token IDs should be in range [0, vocab_size)
+                # Using 256000 as the Gemma vocab size upper bound
+                valid_mask = (text_tokens.min(dim=1).values >= 0) & (text_tokens.max(dim=1).values < 256000)
+                valid_indices = valid_mask.nonzero(as_tuple=True)[0].tolist()
 
-                for i in idx:
+                rng.shuffle(valid_indices)
+
+                for i in valid_indices:
                     yield (latents[i], text_tokens[i], attention_mask[i])
                 
             epoch += 1

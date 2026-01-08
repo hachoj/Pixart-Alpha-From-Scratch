@@ -30,24 +30,28 @@ class QKNormedAttention(nn.Module):
             out_features=query_dim,
             bias=True,
             init_method=lambda w: nn.init.normal_(w, mean=0, std=0.02),
+            fuse_wgrad_accumulation=True,
         )
         self.k_proj = te.Linear(
             in_features=in_kv_dim,
             out_features=query_dim,
             bias=True,
             init_method=lambda w: nn.init.normal_(w, mean=0, std=0.02),
+            fuse_wgrad_accumulation=True,
         )
         self.v_proj = te.Linear(
             in_features=in_kv_dim,
             out_features=query_dim,
             bias=True,
             init_method=lambda w: nn.init.normal_(w, mean=0, std=0.02),
+            fuse_wgrad_accumulation=True,
         )
         self.out_proj = te.Linear(
             in_features=query_dim,
             out_features=query_dim,
             bias=True,
             init_method=lambda w: nn.init.zeros_(w),
+            fuse_wgrad_accumulation=True,
         )
 
         self.q_norm = te.RMSNorm(normalized_shape=head_dim)

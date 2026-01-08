@@ -23,3 +23,5 @@ To switch to FP8 I have a few things that I need to do.
 1. Write new architecture.
 2. Reparameterization to fp8, otherwise, retrain but there's no way that's what I have to do.
 3. Autocast for the training.
+
+Adding fused gradient to model for better accuracy when training with fp8.

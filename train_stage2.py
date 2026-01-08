@@ -284,8 +284,8 @@ def train(
                     text_embed = gemma.encoder(**input_ids).last_hidden_state
                 text_mask = caption_mask.bool()
 
-            with te.autocast(enabled=True, recipe=mxfp8_recipe):
-                pred = model(Xt, t, text_embed, text_mask)
+                with te.autocast(enabled=True, recipe=mxfp8_recipe):
+                    pred = model(Xt, t, text_embed, text_mask)
 
             loss = F.mse_loss(V, pred) / cfg.train.grad_accum
             loss_sum += loss.detach()
@@ -294,9 +294,19 @@ def train(
             else:
                 with model.no_sync():
                     loss.backward()
+        
+        for param in model.parameters():
+            if param.requires_grad:
+                if param.grad is not None:
+                    param.main_grad.add_(param.grad)
+                param.grad = param.main_grad.to(param.dtype)
 
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
+
+        for param in model.parameters():
+            if param.requires_grad:
+                param.main_grad.zero_()
 
         if cfg.wandb.enabled and (step + 1) % cfg.train.every_n_steps == 0:
             loss_detached = loss_sum
@@ -481,7 +491,7 @@ def main(cfg: DictConfig):
     tokenizer = AutoTokenizer.from_pretrained("google/t5gemma-xl-xl-ul2")
     gemma = AutoModelForSeq2SeqLM.from_pretrained(
         "google/t5gemma-xl-xl-ul2",
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map={"": device},
     )
     gemma = gemma.model
@@ -523,6 +533,11 @@ def main(cfg: DictConfig):
     model_ema.eval()
     gemma.eval()
     vae.eval()
+
+    # --- Initializing 'main_grad' for fp8 -> fp32 fused kernels ---
+    for param in model.parameters():
+        if param.requires_grad:
+            param.main_grad = torch.zeros_like(param, dtype=torch.float32)  # pyrefly:ignore
 
     train(
         model,

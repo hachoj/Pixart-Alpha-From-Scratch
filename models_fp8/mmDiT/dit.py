@@ -124,6 +124,7 @@ class DiT(nn.Module):
             out_features=reshape_dim,
             bias=True,
             init_method=lambda w: nn.init.kaiming_normal_(w, mode="fan_in"),
+            fuse_wgrad_accumulation=True,
         )
         self.p = patch_size
 
@@ -134,6 +135,7 @@ class DiT(nn.Module):
             out_features=dim,
             bias=True,
             init_method=lambda w: nn.init.kaiming_normal_(w, mode="fan_in"),
+            fuse_wgrad_accumulation=True,
         )
         self.act = nn.SiLU()
         self.adaLN2 = te.Linear(
@@ -141,6 +143,7 @@ class DiT(nn.Module):
             out_features=dim * 2,
             bias=True,
             init_method=lambda w: nn.init.zeros_(w),
+            fuse_wgrad_accumulation=True,
         )
 
         self.adaLN1_single = te.Linear(
@@ -148,12 +151,14 @@ class DiT(nn.Module):
             out_features=dim,
             bias=True,
             init_method=lambda w: nn.init.kaiming_normal_(w, mode="fan_in"),
+            fuse_wgrad_accumulation=True,
         )
         self.adaLN2_single = te.Linear(
             in_features=dim,
             out_features=6 * dim,
             bias=True,
             init_method=lambda w: nn.init.zeros_(w),
+            fuse_wgrad_accumulation=True,
         )
 
     def forward(
